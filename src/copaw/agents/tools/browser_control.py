@@ -6,19 +6,21 @@ Single tool with action-based API matching browser MCP: start, stop, open,
 navigate, navigate_back, screenshot, snapshot, click, type, eval, evaluate,
 resize, console_messages, handle_dialog, file_upload, fill_form, install,
 press_key, network_requests, run_code, drag, hover, select_option, tabs,
-wait_for, pdf, close. Uses refs from snapshot for ref-based actions.
+wait_for, pdf, close, get_cookies, set_cookies, save_storage_state,
+load_storage_state. Uses refs from snapshot for ref-based actions.
 """
 
 import asyncio
 import atexit
 from concurrent import futures
+from dataclasses import dataclass, field
 import json
 import logging
 import os
 import subprocess
 import sys
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agentscope.message import TextBlock
 from agentscope.tool import ToolResponse
@@ -67,108 +69,599 @@ else:
         return await func(*args, **kwargs)
 
 
-# Process-global browser state (one browser, multiple pages by page_id)
-_state: dict[str, Any] = {
+# ---------------------------------------------------------------------------
+# Per-agent browser context (isolated cookies/session per agent)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentBrowserContext:
+    """Per-agent browser state: owns a Playwright BrowserContext."""
+
+    agent_id: str
+    context: Any = None
+    pages: dict[str, Any] = field(default_factory=dict)
+    refs: dict[str, dict] = field(default_factory=dict)
+    refs_frame: dict[str, Any] = field(default_factory=dict)
+    console_logs: dict[str, list] = field(default_factory=dict)
+    network_requests: dict[str, list] = field(default_factory=dict)
+    pending_dialogs: dict[str, list] = field(default_factory=dict)
+    pending_file_choosers: dict[str, list] = field(default_factory=dict)
+    current_page_id: str | None = None
+    page_counter: int = 0
+    last_activity_time: float = 0.0
+    _sync_context: Any = None
+    _creating_page: bool = False
+    _pending_session_storage: list = field(default_factory=list)
+
+
+# Shared browser process state (single Playwright instance + browser)
+_browser_state: dict[str, Any] = {
     "playwright": None,
     "browser": None,
-    "context": None,
-    "pages": {},
-    "refs": {},  # page_id -> ref -> {role, name?, nth?}
-    "refs_frame": {},  # page_id -> frame for last snapshot
-    "console_logs": {},  # page_id -> list of {level, text}
-    "network_requests": {},  # page_id -> list of request dicts
-    "pending_dialogs": {},  # page_id -> dialog handlers
-    "pending_file_choosers": {},  # page_id -> FileChooser list
     "headless": True,
-    "current_page_id": None,
-    "page_counter": 0,  # monotonic counter for page_N ids, avoids reuse after close
-    "last_activity_time": 0.0,  # monotonic timestamp of last browser activity
-    "_idle_task": None,  # background asyncio.Task for idle watchdog
-    "_last_browser_error": None,  # message when launch failed (for user-facing error)
-    "_sync_browser": None,  # sync browser handle for hybrid mode
-    "_sync_context": None,  # sync context handle for hybrid mode
-    "_sync_playwright": None,  # sync playwright handle for hybrid mode
+    "browser_kind": None,  # "chromium" or "webkit"
+    "_idle_task": None,
+    "_last_browser_error": None,
+    "_sync_browser": None,
+    "_sync_playwright": None,
 }
+
+# Per-agent contexts keyed by agent_id
+_agent_contexts: dict[str, AgentBrowserContext] = {}
+
+# Auto-persist storage state directory
+_STORAGE_STATE_DIR = os.path.join(
+    os.path.expanduser("~"), ".copaw", "browser_state"
+)
+
+
+def _storage_state_path(agent_id: str) -> str:
+    """Return the auto-persist file path for an agent's storage state."""
+    safe_id = agent_id.replace("/", "_").replace("\\", "_")
+    return os.path.join(_STORAGE_STATE_DIR, f"{safe_id}.json")
+
+
+def _get_agent_id() -> str:
+    """Get the current agent ID from context."""
+    from ...app.agent_context import get_current_agent_id
+
+    return get_current_agent_id()
+
+
+def _get_agent_ctx(
+    agent_id: str = "",
+) -> AgentBrowserContext | None:
+    """Get the AgentBrowserContext for the given (or current) agent."""
+    if not agent_id:
+        agent_id = _get_agent_id()
+    return _agent_contexts.get(agent_id)
+
+
+def _get_or_create_agent_ctx(
+    agent_id: str = "",
+) -> AgentBrowserContext:
+    """Get or create the AgentBrowserContext for the given agent."""
+    if not agent_id:
+        agent_id = _get_agent_id()
+    if agent_id not in _agent_contexts:
+        _agent_contexts[agent_id] = AgentBrowserContext(
+            agent_id=agent_id,
+        )
+    return _agent_contexts[agent_id]
+
 
 # Stop the browser after this many seconds of inactivity (default 30 minutes).
 _BROWSER_IDLE_TIMEOUT = 1800.0
 
+# ---------------------------------------------------------------------------
+# Lifecycle callback system (for browser_live_view router)
+# ---------------------------------------------------------------------------
+_lifecycle_callbacks: list[Callable] = []
 
-def _touch_activity() -> None:
-    """Record the current time as the last browser activity timestamp."""
-    _state["last_activity_time"] = time.monotonic()
+
+def register_browser_lifecycle_callback(cb: Callable) -> None:
+    """Register a callback to be notified of browser lifecycle events."""
+    if cb not in _lifecycle_callbacks:
+        _lifecycle_callbacks.append(cb)
+
+
+def unregister_browser_lifecycle_callback(cb: Callable) -> None:
+    """Unregister a previously registered lifecycle callback."""
+    try:
+        _lifecycle_callbacks.remove(cb)
+    except ValueError:
+        pass
+
+
+async def _notify_lifecycle(event: str, **kwargs: Any) -> None:
+    """Notify all registered callbacks of a lifecycle event."""
+    for cb in list(_lifecycle_callbacks):
+        try:
+            result = cb(event, **kwargs)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            logger.debug(
+                "Lifecycle callback error for event=%s",
+                event,
+                exc_info=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Public access functions (for router / live-view)
+# ---------------------------------------------------------------------------
+
+
+def get_browser_state_summary(agent_id: str = "") -> dict:
+    """Return a summary of the current browser state for an agent."""
+    running = _is_browser_running()
+    ctx = _get_agent_ctx(agent_id)
+    page_id = ctx.current_page_id if ctx else None
+    url = ""
+    viewport = {"width": 1280, "height": 720}
+    if running and ctx and page_id:
+        page = ctx.pages.get(page_id)
+        if page:
+            try:
+                url = page.url
+            except Exception:
+                pass
+            try:
+                vp = page.viewport_size
+                if vp:
+                    viewport = {
+                        "width": vp.get("width", 1280),
+                        "height": vp.get("height", 720),
+                    }
+            except Exception:
+                pass
+    return {
+        "running": running,
+        "headless": _browser_state.get("headless", True),
+        "current_page_id": page_id,
+        "url": url,
+        "viewport": viewport,
+        "agent_id": ctx.agent_id if ctx else (agent_id or "default"),
+    }
+
+
+def is_browser_running() -> bool:
+    """Public: check if the shared browser process is running."""
+    return _is_browser_running()
+
+
+async def get_browser_tabs(agent_id: str = "") -> list[dict]:
+    """Return a list of open tabs for an agent.
+
+    Each entry: ``{"page_id": str, "url": str, "title": str,
+    "active": bool}``.
+    """
+    ctx = _get_agent_ctx(agent_id)
+    if not ctx or not _is_browser_running():
+        return []
+    tabs: list[dict] = []
+    for pid, page in ctx.pages.items():
+        url = ""
+        title = ""
+        try:
+            url = page.url
+        except Exception:
+            pass
+        try:
+            if _USE_SYNC_PLAYWRIGHT:
+                title = page.title()
+            else:
+                title = await page.title()
+        except Exception:
+            pass
+        tabs.append(
+            {
+                "page_id": pid,
+                "url": url,
+                "title": title or url or pid,
+                "active": pid == ctx.current_page_id,
+            },
+        )
+    return tabs
+
+
+def set_current_page(page_id: str, agent_id: str = "") -> bool:
+    """Switch the active page for an agent.  Returns True on success."""
+    ctx = _get_agent_ctx(agent_id)
+    if not ctx or page_id not in ctx.pages:
+        return False
+    ctx.current_page_id = page_id
+    return True
+
+
+def get_browser_kind() -> str | None:
+    """Return the browser engine kind: ``"chromium"``, ``"webkit"``,
+    or ``None`` if no browser is running."""
+    return _browser_state.get("browser_kind")
+
+
+def is_agent_browser_active(agent_id: str = "") -> bool:
+    """Check if the given agent has an active browser context."""
+    ctx = _get_agent_ctx(agent_id)
+    return ctx is not None and ctx.context is not None
+
+
+def get_page(page_id: str = "", agent_id: str = ""):
+    """Public: get page for an agent. Falls back to current page."""
+    ctx = _get_agent_ctx(agent_id)
+    if not ctx:
+        return None
+    if not page_id:
+        page_id = ctx.current_page_id or ""
+    return ctx.pages.get(page_id)
+
+
+async def create_new_tab(agent_id: str = "") -> dict:
+    """Public: create a new blank tab for an agent.
+
+    Returns ``{"ok": True, "page_id": ...}`` on success.
+    """
+    if not agent_id:
+        agent_id = _get_agent_id()
+    ctx = _get_agent_ctx(agent_id)
+    if not ctx or not _is_browser_running():
+        return {"ok": False, "error": "Browser not running"}
+    try:
+        ctx._creating_page = True
+        try:
+            if _USE_SYNC_PLAYWRIGHT:
+                page = await _run_sync(ctx._sync_context.new_page)
+            else:
+                page = await ctx.context.new_page()
+        finally:
+            ctx._creating_page = False
+        new_id = _next_page_id(ctx)
+        ctx.refs[new_id] = {}
+        ctx.console_logs[new_id] = []
+        ctx.network_requests[new_id] = []
+        ctx.pending_dialogs[new_id] = []
+        ctx.pending_file_choosers[new_id] = []
+        _attach_page_listeners(page, new_id, ctx)
+        ctx.pages[new_id] = page
+        ctx.current_page_id = new_id
+        await _notify_lifecycle(
+            "navigated",
+            url="about:blank",
+            page_id=new_id,
+            agent_id=ctx.agent_id,
+        )
+        return {"ok": True, "page_id": new_id}
+    except Exception as e:
+        return {"ok": False, "error": f"New tab failed: {e!s}"}
+
+
+async def close_tab_by_id(
+    page_id: str,
+    agent_id: str = "",
+) -> dict:
+    """Public: close a specific tab by page_id.
+
+    Returns ``{"ok": True}`` on success.
+    """
+    if not agent_id:
+        agent_id = _get_agent_id()
+    ctx = _get_agent_ctx(agent_id)
+    if not ctx:
+        return {"ok": False, "error": "No browser context"}
+    page = ctx.pages.get(page_id)
+    if not page:
+        return {"ok": False, "error": f"Page '{page_id}' not found"}
+    try:
+        if _USE_SYNC_PLAYWRIGHT:
+            await _run_sync(page.close)
+        else:
+            await page.close()
+        ctx.pages.pop(page_id, None)
+        ctx.refs.pop(page_id, None)
+        ctx.refs_frame.pop(page_id, None)
+        ctx.console_logs.pop(page_id, None)
+        ctx.network_requests.pop(page_id, None)
+        ctx.pending_dialogs.pop(page_id, None)
+        ctx.pending_file_choosers.pop(page_id, None)
+        if ctx.current_page_id == page_id:
+            remaining = list(ctx.pages.keys())
+            ctx.current_page_id = remaining[0] if remaining else None
+        return {"ok": True, "page_id": ctx.current_page_id}
+    except Exception as e:
+        return {"ok": False, "error": f"Close tab failed: {e!s}"}
+
+
+def touch_activity(agent_id: str = "") -> None:
+    """Public: reset idle timer for an agent."""
+    _touch_activity(agent_id)
+
+
+def _touch_activity(agent_id: str = "") -> None:
+    """Record the current time as the last activity for an agent."""
+    ctx = _get_agent_ctx(agent_id)
+    if ctx:
+        ctx.last_activity_time = time.monotonic()
 
 
 def _is_browser_running() -> bool:
-    """Check if browser is currently running (sync or async mode)."""
+    """Check if the shared browser process is running."""
     if _USE_SYNC_PLAYWRIGHT:
-        return _state.get("_sync_browser") is not None
-    return _state.get("browser") is not None
+        return _browser_state.get("_sync_browser") is not None
+    return _browser_state.get("browser") is not None
 
 
-def _reset_browser_state() -> None:
-    """Reset all browser-related state variables."""
-    # Clear sync/async specific state
-    _state["playwright"] = None
-    _state["browser"] = None
-    _state["context"] = None
-    _state["_sync_playwright"] = None
-    _state["_sync_browser"] = None
-    _state["_sync_context"] = None
-    # Clear shared state
-    _state["pages"].clear()
-    _state["refs"].clear()
-    _state["refs_frame"].clear()
-    _state["console_logs"].clear()
-    _state["network_requests"].clear()
-    _state["pending_dialogs"].clear()
-    _state["pending_file_choosers"].clear()
-    _state["current_page_id"] = None
-    _state["page_counter"] = 0
-    _state["last_activity_time"] = 0.0
-    _state["headless"] = True
+def _close_agent_context(agent_id: str) -> None:
+    """Close a single agent's browser context and clean up."""
+    ctx = _agent_contexts.pop(agent_id, None)
+    if ctx is None:
+        return
+    # Auto-save storage state (cookies + localStorage + sessionStorage).
+    # Note: on macOS (async Playwright), storage_state() / evaluate()
+    # return coroutines. In this sync atexit path we cannot await them,
+    # so we only attempt save when using sync Playwright (Windows).
+    # The normal close path (_async_close_agent_context) handles all
+    # platforms correctly.
+    if _USE_SYNC_PLAYWRIGHT and ctx._sync_context is not None:
+        try:
+            state_path = _storage_state_path(agent_id)
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            state = ctx._sync_context.storage_state()
+            session_storage: list[dict] = []
+            for pid, page in ctx.pages.items():
+                try:
+                    ss = page.evaluate(
+                        "(() => {"
+                        "  const d = {};"
+                        "  for (let i = 0;"
+                        " i < sessionStorage.length; i++) {"
+                        "    const k = sessionStorage.key(i);"
+                        "    d[k] = sessionStorage.getItem(k);"
+                        "  }"
+                        "  return {"
+                        " origin: location.origin, data: d };"
+                        "})()"
+                    )
+                    if ss and ss.get("data"):
+                        session_storage.append(ss)
+                except Exception:
+                    pass
+            state["sessionStorage"] = session_storage
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    # Close all pages first, then the context
+    for page in list(ctx.pages.values()):
+        try:
+            page.close()
+        except Exception:
+            pass
+    ctx.pages.clear()
+    if _USE_SYNC_PLAYWRIGHT:
+        if ctx._sync_context is not None:
+            try:
+                ctx._sync_context.close()
+            except Exception:
+                pass
+            ctx._sync_context = None
+    else:
+        if ctx.context is not None:
+            try:
+                # sync close since we may be in atexit
+                ctx.context.close()
+            except Exception:
+                pass
+            ctx.context = None
 
 
-async def _idle_watchdog(idle_seconds: float = _BROWSER_IDLE_TIMEOUT) -> None:
-    """Background task: stop the browser after it has been idle for *idle_seconds*.
+async def _async_close_agent_context(agent_id: str) -> None:
+    """Async version: close a single agent's browser context."""
+    ctx = _agent_contexts.pop(agent_id, None)
+    if ctx is None:
+        return
+    # Auto-save storage state (cookies + localStorage + sessionStorage)
+    context = ctx._sync_context if _USE_SYNC_PLAYWRIGHT else ctx.context
+    if context is not None:
+        try:
+            state_path = _storage_state_path(agent_id)
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            if _USE_SYNC_PLAYWRIGHT:
+                state = await _run_sync(context.storage_state)
+            else:
+                state = await context.storage_state()
+            # Also capture sessionStorage from all pages
+            session_storage: list[dict] = []
+            for pid, page in ctx.pages.items():
+                try:
+                    js = (
+                        "(() => {"
+                        "  const d = {};"
+                        "  for (let i = 0; i < sessionStorage.length; i++) {"
+                        "    const k = sessionStorage.key(i);"
+                        "    d[k] = sessionStorage.getItem(k);"
+                        "  }"
+                        "  return { origin: location.origin, data: d };"
+                        "})()"
+                    )
+                    if _USE_SYNC_PLAYWRIGHT:
+                        ss = await _run_sync(page.evaluate, js)
+                    else:
+                        ss = await page.evaluate(js)
+                    if ss and ss.get("data"):
+                        session_storage.append(ss)
+                except Exception:
+                    pass
+            state["sessionStorage"] = session_storage
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            logger.info(
+                "Auto-saved storage state for agent '%s' to %s"
+                " (cookies=%d, sessionStorage=%d origins)",
+                agent_id,
+                state_path,
+                len(state.get("cookies", [])),
+                len(session_storage),
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to auto-save storage state: %s", e,
+            )
+    for page in list(ctx.pages.values()):
+        try:
+            if _USE_SYNC_PLAYWRIGHT:
+                page.close()
+            else:
+                await page.close()
+        except Exception:
+            pass
+    ctx.pages.clear()
+    if _USE_SYNC_PLAYWRIGHT:
+        if ctx._sync_context is not None:
+            try:
+                ctx._sync_context.close()
+            except Exception:
+                pass
+            ctx._sync_context = None
+    else:
+        if ctx.context is not None:
+            try:
+                await ctx.context.close()
+            except Exception:
+                pass
+            ctx.context = None
 
-    This reclaims Chrome renderer processes that accumulate when pages are
-    opened during agent tasks but never explicitly closed.
+
+def _stop_browser_process() -> None:
+    """Close the shared browser process and playwright (sync)."""
+    if _USE_SYNC_PLAYWRIGHT:
+        sb = _browser_state.get("_sync_browser")
+        if sb is not None:
+            try:
+                sb.close()
+            except Exception:
+                pass
+        sp = _browser_state.get("_sync_playwright")
+        if sp is not None:
+            try:
+                sp.stop()
+            except Exception:
+                pass
+        _browser_state["_sync_browser"] = None
+        _browser_state["_sync_playwright"] = None
+    else:
+        b = _browser_state.get("browser")
+        if b is not None:
+            try:
+                b.close()
+            except Exception:
+                pass
+        pw = _browser_state.get("playwright")
+        if pw is not None:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+        _browser_state["browser"] = None
+        _browser_state["playwright"] = None
+    _browser_state["headless"] = True
+    _browser_state["browser_kind"] = None
+    _browser_state["_last_browser_error"] = None
+
+
+async def _async_stop_browser_process() -> None:
+    """Async version: close the shared browser process."""
+    if _USE_SYNC_PLAYWRIGHT:
+        sb = _browser_state.get("_sync_browser")
+        if sb is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    _get_executor(),
+                    sb.close,
+                )
+            except Exception:
+                pass
+        sp = _browser_state.get("_sync_playwright")
+        if sp is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    _get_executor(),
+                    sp.stop,
+                )
+            except Exception:
+                pass
+        _browser_state["_sync_browser"] = None
+        _browser_state["_sync_playwright"] = None
+    else:
+        b = _browser_state.get("browser")
+        if b is not None:
+            try:
+                await b.close()
+            except Exception:
+                pass
+        pw = _browser_state.get("playwright")
+        if pw is not None:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        _browser_state["browser"] = None
+        _browser_state["playwright"] = None
+    _browser_state["headless"] = True
+    _browser_state["browser_kind"] = None
+    _browser_state["_last_browser_error"] = None
+
+
+async def _idle_watchdog(
+    idle_seconds: float = _BROWSER_IDLE_TIMEOUT,
+) -> None:
+    """Background task: check all agent contexts for idle timeout.
+
+    Closes individual agent contexts that have been idle, and shuts down
+    the shared browser process when no agents remain.
     """
     try:
         while True:
             await asyncio.sleep(60)  # check every minute
             if not _is_browser_running():
                 return
-            idle = time.monotonic() - _state.get("last_activity_time", 0.0)
-            if idle >= idle_seconds:
+            now = time.monotonic()
+            expired = [
+                aid
+                for aid, ctx in list(_agent_contexts.items())
+                if (now - ctx.last_activity_time) >= idle_seconds
+            ]
+            for aid in expired:
                 logger.info(
-                    "Browser idle for %.0fs (limit %.0fs), stopping to release resources",
-                    idle,
-                    idle_seconds,
+                    "Agent '%s' browser context idle, closing",
+                    aid,
                 )
-                await _action_stop()
+                await _async_close_agent_context(aid)
+                await _notify_lifecycle(
+                    "stopped",
+                    agent_id=aid,
+                )
+            if not _agent_contexts:
+                logger.info(
+                    "No active agent contexts, stopping browser",
+                )
+                await _async_stop_browser_process()
                 return
     except asyncio.CancelledError:
         pass
 
 
 def _atexit_cleanup() -> None:
-    """Best-effort browser cleanup registered with :func:`atexit`.
-
-    Playwright child processes are cleaned up by the OS when the parent
-    exits, but this gives Playwright a chance to flush any pending I/O and
-    close Chrome gracefully before the process disappears.
-    """
+    """Best-effort browser cleanup registered with :func:`atexit`."""
     if not _is_browser_running():
         return
-
-    try:
-        loop = asyncio.get_event_loop()
-        if not loop.is_running() and not loop.is_closed():
-            loop.run_until_complete(_action_stop())
-    except Exception:
-        pass
+    # Close all agent contexts synchronously
+    for aid in list(_agent_contexts.keys()):
+        _close_agent_context(aid)
+    _stop_browser_process()
 
 
 atexit.register(_atexit_cleanup)
@@ -232,7 +725,9 @@ def _ensure_playwright_sync():
 
 
 def _sync_browser_launch(headless: bool):
-    """Launch browser using sync Playwright (for hybrid mode)."""
+    """Launch browser using sync Playwright (for hybrid mode).
+    Returns (playwright, browser, kind) — context creation is per-agent.
+    *kind* is ``"chromium"`` or ``"webkit"``."""
     sync_playwright = _ensure_playwright_sync()
     pw = sync_playwright().start()  # Start without context manager
     use_default = not is_running_in_container() and os.environ.get(
@@ -248,6 +743,7 @@ def _sync_browser_launch(headless: bool):
     elif default_kind != "webkit":
         exe = _chromium_executable_path()
 
+    kind: str = "chromium"
     if exe:
         launch_kwargs = {"headless": headless}
         extra_args = _chromium_launch_args()
@@ -257,6 +753,7 @@ def _sync_browser_launch(headless: bool):
         browser = pw.chromium.launch(**launch_kwargs)
     elif default_kind == "webkit" or sys.platform == "darwin":
         browser = pw.webkit.launch(headless=headless)
+        kind = "webkit"
     else:
         launch_kwargs = {"headless": headless}
         extra_args = _chromium_launch_args()
@@ -264,23 +761,7 @@ def _sync_browser_launch(headless: bool):
             launch_kwargs["args"] = extra_args
         browser = pw.chromium.launch(**launch_kwargs)
 
-    context = browser.new_context()
-    _attach_context_listeners(context)
-    return pw, browser, context
-
-
-def _sync_browser_close():
-    """Close browser using sync Playwright (for hybrid mode)."""
-    if _state["_sync_browser"] is not None:
-        try:
-            _state["_sync_browser"].close()
-        except Exception:
-            pass
-    if _state["_sync_playwright"] is not None:
-        try:
-            _state["_sync_playwright"].stop()
-        except Exception:
-            pass
+    return pw, browser, kind
 
 
 def _parse_json_param(value: str, default: Any = None):
@@ -340,6 +821,9 @@ async def browser_use(  # pylint: disable=R0911,R0912
     text_gone: str = "",
     frame_selector: str = "",
     headed: bool = False,
+    cookies_json: str = "",
+    cookies_file: str = "",
+    cookies_url: str = "",
 ) -> ToolResponse:
     """Control browser (Playwright). Default is headless. Use headed=True with
     action=start to open a visible browser window. Flow: start, open(url),
@@ -352,7 +836,8 @@ async def browser_use(  # pylint: disable=R0911,R0912
             navigate_back, snapshot, screenshot, click, type, eval, evaluate,
             resize, console_messages, network_requests, handle_dialog,
             file_upload, fill_form, install, press_key, run_code, drag, hover,
-            select_option, tabs, wait_for, pdf, close.
+            select_option, tabs, wait_for, pdf, close, get_cookies,
+            set_cookies, save_storage_state, load_storage_state.
         url (str):
             URL to open. Required for action=open or navigate.
         page_id (str):
@@ -451,6 +936,17 @@ async def browser_use(  # pylint: disable=R0911,R0912
         headed (bool):
             When True with action=start, launch a visible browser window
             (non-headless). User can see the real browser. Default False.
+        cookies_json (str):
+            JSON array of cookie objects for action=set_cookies. Each cookie
+            must have "name", "value", "url" or "domain"+"path". Example:
+            [{"name":"token","value":"abc","url":"http://example.com"}]
+        cookies_file (str):
+            File path for action=get_cookies (save) or set_cookies (load).
+            get_cookies saves cookies to this file. set_cookies loads from
+            this file (ignored if cookies_json is provided).
+        cookies_url (str):
+            Filter cookies by URL for action=get_cookies. If empty, returns
+            all cookies. Example: "http://192.168.3.123:31813"
     """
     action = (action or "").strip().lower()
     if not action:
@@ -463,8 +959,9 @@ async def browser_use(  # pylint: disable=R0911,R0912
         )
 
     page_id = (page_id or "default").strip() or "default"
-    current = _state.get("current_page_id")
-    pages = _state.get("pages") or {}
+    ctx = _get_agent_ctx()
+    current = ctx.current_page_id if ctx else None
+    pages = ctx.pages if ctx else {}
     if page_id == "default" and current and current in pages:
         page_id = current
 
@@ -589,6 +1086,16 @@ async def browser_use(  # pylint: disable=R0911,R0912
             return await _action_pdf(page_id, path)
         if action == "close":
             return await _action_close(page_id)
+        if action == "get_cookies":
+            return await _action_get_cookies(cookies_url, cookies_file)
+        if action == "set_cookies":
+            return await _action_set_cookies(
+                cookies_json, cookies_file
+            )
+        if action == "save_storage_state":
+            return await _action_save_storage_state(cookies_file)
+        if action == "load_storage_state":
+            return await _action_load_storage_state(cookies_file)
         return _tool_response(
             json.dumps(
                 {"ok": False, "error": f"Unknown action: {action}"},
@@ -609,12 +1116,18 @@ async def browser_use(  # pylint: disable=R0911,R0912
 
 def _get_page(page_id: str):
     """Return page for page_id or None if not found."""
-    return _state["pages"].get(page_id)
+    ctx = _get_agent_ctx()
+    if not ctx:
+        return None
+    return ctx.pages.get(page_id)
 
 
 def _get_refs(page_id: str) -> dict[str, dict]:
     """Return refs map for page_id (ref -> {role, name?, nth?})."""
-    return _state["refs"].setdefault(page_id, {})
+    ctx = _get_agent_ctx()
+    if not ctx:
+        return {}
+    return ctx.refs.setdefault(page_id, {})
 
 
 def _get_root(page, _page_id: str, frame_selector: str = ""):
@@ -645,15 +1158,20 @@ def _get_locator_by_ref(
     return locator
 
 
-def _attach_page_listeners(page, page_id: str) -> None:
-    """Attach console and request listeners for a page."""
-    logs = _state["console_logs"].setdefault(page_id, [])
+def _attach_page_listeners(
+    page,
+    page_id: str,
+    ctx: AgentBrowserContext,
+) -> None:
+    """Attach console and request listeners for a page.
+    Captures *ctx* in closures so callbacks work even if ContextVar changes."""
+    logs = ctx.console_logs.setdefault(page_id, [])
 
     def on_console(msg):
         logs.append({"level": msg.type, "text": msg.text})
 
     page.on("console", on_console)
-    requests_list = _state["network_requests"].setdefault(page_id, [])
+    requests_list = ctx.network_requests.setdefault(page_id, [])
 
     def on_request(req):
         requests_list.append(
@@ -672,13 +1190,13 @@ def _attach_page_listeners(page, page_id: str) -> None:
 
     page.on("request", on_request)
     page.on("response", on_response)
-    dialogs = _state["pending_dialogs"].setdefault(page_id, [])
+    dialogs = ctx.pending_dialogs.setdefault(page_id, [])
 
     def on_dialog(dialog):
         dialogs.append(dialog)
 
     page.on("dialog", on_dialog)
-    choosers = _state["pending_file_choosers"].setdefault(page_id, [])
+    choosers = ctx.pending_file_choosers.setdefault(page_id, [])
 
     def on_filechooser(chooser):
         choosers.append(chooser)
@@ -686,27 +1204,34 @@ def _attach_page_listeners(page, page_id: str) -> None:
     page.on("filechooser", on_filechooser)
 
 
-def _next_page_id() -> str:
-    """Return a unique page_id (page_N).
-    Uses monotonic counter so IDs are not reused after close."""
-    _state["page_counter"] = _state.get("page_counter", 0) + 1
-    return f"page_{_state['page_counter']}"
+def _next_page_id(ctx: AgentBrowserContext) -> str:
+    """Return a unique page_id (page_N) for the given agent context."""
+    ctx.page_counter += 1
+    return f"page_{ctx.page_counter}"
 
 
-def _attach_context_listeners(context) -> None:
+def _attach_context_listeners(
+    context,
+    ctx: AgentBrowserContext,
+) -> None:
     """When the page opens a new tab (e.g. target=_blank, window.open),
-    register it and set as current."""
+    register it under the agent's context.
+    Captures *ctx* so callbacks work even if ContextVar changes."""
 
     def on_page(page):
-        new_id = _next_page_id()
-        _state["refs"][new_id] = {}
-        _state["console_logs"][new_id] = []
-        _state["network_requests"][new_id] = []
-        _state["pending_dialogs"][new_id] = []
-        _state["pending_file_choosers"][new_id] = []
-        _attach_page_listeners(page, new_id)
-        _state["pages"][new_id] = page
-        _state["current_page_id"] = new_id
+        # Skip if page is being created programmatically (create_new_tab,
+        # _action_open, etc.) — the caller will register it.
+        if ctx._creating_page:
+            return
+        new_id = _next_page_id(ctx)
+        ctx.refs[new_id] = {}
+        ctx.console_logs[new_id] = []
+        ctx.network_requests[new_id] = []
+        ctx.pending_dialogs[new_id] = []
+        ctx.pending_file_choosers[new_id] = []
+        _attach_page_listeners(page, new_id, ctx)
+        ctx.pages[new_id] = page
+        ctx.current_page_id = new_id
         logger.debug(
             "New tab opened by page, registered as page_id=%s",
             new_id,
@@ -715,186 +1240,264 @@ def _attach_context_listeners(context) -> None:
     context.on("page", on_page)
 
 
-async def _ensure_browser() -> bool:  # pylint: disable=too-many-branches
-    """Start browser if not running. Return True if ready, False on failure."""
-    # Check browser state based on mode
-    if _USE_SYNC_PLAYWRIGHT:
-        if (
-            _state["_sync_browser"] is not None
-            and _state["_sync_context"] is not None
-        ):
-            _touch_activity()
-            return True
-    else:
-        if _state["browser"] is not None and _state["context"] is not None:
-            _touch_activity()
-            return True
+async def _ensure_browser(agent_id: str = "") -> bool:  # pylint: disable=too-many-branches
+    """Two-phase ensure: (1) shared browser process, (2) agent context.
+    Return True if ready, False on failure."""
+    ctx = _get_or_create_agent_ctx(agent_id)
 
-    try:
-        if _USE_SYNC_PLAYWRIGHT:
-            # Hybrid mode: use sync Playwright in thread pool
-            loop = asyncio.get_event_loop()
-            pw, browser, context = await loop.run_in_executor(
-                _get_executor(),
-                lambda: _sync_browser_launch(_state["headless"]),
-            )
-            _state["_sync_playwright"] = pw
-            _state["_sync_browser"] = browser
-            _state["_sync_context"] = context
-        else:
-            # Standard mode: use async Playwright
-            async_playwright = _ensure_playwright_async()
-            pw = await async_playwright().start()
-            # Prefer OS default browser when available (e.g. user's default Chrome/Safari).
-            use_default = not is_running_in_container() and os.environ.get(
-                "COPAW_BROWSER_USE_DEFAULT",
-                "1",
-            ).strip().lower() in ("1", "true", "yes")
-            default_kind, default_path = (
-                get_system_default_browser() if use_default else (None, None)
-            )
-            exe: Optional[str] = None
-            if default_kind == "chromium" and default_path:
-                exe = default_path
-            elif default_kind != "webkit":
-                exe = _chromium_executable_path()
-            if exe:
-                # System Chrome/Edge/Chromium (default or discovered)
-                launch_kwargs: dict[str, Any] = {
-                    "headless": _state["headless"],
-                }
-                extra_args = _chromium_launch_args()
-                if extra_args:
-                    launch_kwargs["args"] = extra_args
-                launch_kwargs["executable_path"] = exe
-                pw_browser = await pw.chromium.launch(**launch_kwargs)
-            elif default_kind == "webkit" or sys.platform == "darwin":
-                # macOS: default Safari or no Chromium → use WebKit (Safari)
-                pw_browser = await pw.webkit.launch(
-                    headless=_state["headless"],
+    # Phase 1: ensure shared browser process
+    if not _is_browser_running():
+        try:
+            if _USE_SYNC_PLAYWRIGHT:
+                loop = asyncio.get_event_loop()
+                pw, browser, kind = await loop.run_in_executor(
+                    _get_executor(),
+                    lambda: _sync_browser_launch(
+                        _browser_state["headless"],
+                    ),
                 )
+                _browser_state["_sync_playwright"] = pw
+                _browser_state["_sync_browser"] = browser
+                _browser_state["browser_kind"] = kind
             else:
-                # Windows/Linux without system Chromium → Playwright's Chromium
-                launch_kwargs = {"headless": _state["headless"]}
-                extra_args = _chromium_launch_args()
-                if extra_args:
-                    launch_kwargs["args"] = extra_args
-                pw_browser = await pw.chromium.launch(**launch_kwargs)
-            context = await pw_browser.new_context()
-            _attach_context_listeners(context)
-            _state["playwright"] = pw
-            _state["browser"] = pw_browser
-            _state["context"] = context
-        _state["_last_browser_error"] = None
-        _touch_activity()
-        _start_idle_watchdog()
-        return True
+                async_playwright = _ensure_playwright_async()
+                pw = await async_playwright().start()
+                use_default = not is_running_in_container() and os.environ.get(
+                    "COPAW_BROWSER_USE_DEFAULT",
+                    "1",
+                ).strip().lower() in ("1", "true", "yes")
+                default_kind, default_path = (
+                    get_system_default_browser()
+                    if use_default
+                    else (None, None)
+                )
+                exe: Optional[str] = None
+                if default_kind == "chromium" and default_path:
+                    exe = default_path
+                elif default_kind != "webkit":
+                    exe = _chromium_executable_path()
+                kind = "chromium"
+                if exe:
+                    launch_kwargs: dict[str, Any] = {
+                        "headless": _browser_state["headless"],
+                    }
+                    extra_args = _chromium_launch_args()
+                    if extra_args:
+                        launch_kwargs["args"] = extra_args
+                    launch_kwargs["executable_path"] = exe
+                    pw_browser = await pw.chromium.launch(
+                        **launch_kwargs,
+                    )
+                elif default_kind == "webkit" or sys.platform == "darwin":
+                    pw_browser = await pw.webkit.launch(
+                        headless=_browser_state["headless"],
+                    )
+                    kind = "webkit"
+                else:
+                    launch_kwargs = {
+                        "headless": _browser_state["headless"],
+                    }
+                    extra_args = _chromium_launch_args()
+                    if extra_args:
+                        launch_kwargs["args"] = extra_args
+                    pw_browser = await pw.chromium.launch(
+                        **launch_kwargs,
+                    )
+                _browser_state["playwright"] = pw
+                _browser_state["browser"] = pw_browser
+                _browser_state["browser_kind"] = kind
+            _browser_state["_last_browser_error"] = None
+            _start_idle_watchdog()
+        except Exception as e:
+            _browser_state["_last_browser_error"] = str(e)
+            return False
+
+    # Phase 2: ensure agent has a BrowserContext
+    has_context = (
+        ctx._sync_context is not None
+        if _USE_SYNC_PLAYWRIGHT
+        else ctx.context is not None
+    )
+    if not has_context:
+        # Check for auto-saved storage state from previous session
+        state_path = _storage_state_path(
+            agent_id if agent_id else _get_agent_id(),
+        )
+        has_saved_state = os.path.isfile(state_path)
+        try:
+            if _USE_SYNC_PLAYWRIGHT:
+                loop = asyncio.get_event_loop()
+                browser = _browser_state["_sync_browser"]
+                if has_saved_state:
+                    context = await loop.run_in_executor(
+                        _get_executor(),
+                        lambda: browser.new_context(
+                            storage_state=state_path,
+                        ),
+                    )
+                    logger.info(
+                        "Auto-loaded storage state for agent '%s'"
+                        " from %s",
+                        agent_id,
+                        state_path,
+                    )
+                else:
+                    context = await loop.run_in_executor(
+                        _get_executor(),
+                        browser.new_context,
+                    )
+                ctx._sync_context = context
+            else:
+                browser = _browser_state["browser"]
+                if has_saved_state:
+                    context = await browser.new_context(
+                        storage_state=state_path,
+                    )
+                    logger.info(
+                        "Auto-loaded storage state for agent '%s'"
+                        " from %s",
+                        agent_id,
+                        state_path,
+                    )
+                else:
+                    context = await browser.new_context()
+                ctx.context = context
+            _attach_context_listeners(context, ctx)
+        except Exception as e:
+            _browser_state["_last_browser_error"] = str(e)
+            return False
+
+        # Store saved sessionStorage data on ctx for lazy restore
+        if has_saved_state:
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                ss_data = saved.get("sessionStorage", [])
+                if ss_data:
+                    ctx._pending_session_storage = ss_data
+            except Exception:
+                pass
+
+    _touch_activity(agent_id)
+    return True
+
+
+async def _restore_session_storage(
+    page: Any,
+    ctx: AgentBrowserContext,
+) -> None:
+    """Restore sessionStorage to a page if pending data exists."""
+    ss_data = getattr(ctx, "_pending_session_storage", None)
+    if not ss_data:
+        return
+    try:
+        # Get the page's origin
+        if _USE_SYNC_PLAYWRIGHT:
+            origin = await _run_sync(
+                page.evaluate, "location.origin",
+            )
+        else:
+            origin = await page.evaluate("location.origin")
+        # Find matching sessionStorage data
+        for entry in ss_data:
+            if entry.get("origin") == origin:
+                js = (
+                    "(data) => {"
+                    "  for (const [k, v] of Object.entries(data)) {"
+                    "    sessionStorage.setItem(k, v);"
+                    "  }"
+                    "}"
+                )
+                if _USE_SYNC_PLAYWRIGHT:
+                    await _run_sync(
+                        page.evaluate, js, entry["data"],
+                    )
+                else:
+                    await page.evaluate(js, entry["data"])
+                logger.info(
+                    "Restored sessionStorage for origin '%s'"
+                    " (%d items)",
+                    origin,
+                    len(entry["data"]),
+                )
+                break
     except Exception as e:
-        _state["_last_browser_error"] = str(e)
-        return False
+        logger.warning("Failed to restore sessionStorage: %s", e)
+
+
+async def ensure_browser_for_agent(agent_id: str) -> bool:
+    """Public: ensure browser and agent context are ready.
+
+    Can be called from outside the agent execution context
+    (e.g. the live-view router) with an explicit *agent_id*.
+    """
+    return await _ensure_browser(agent_id=agent_id)
 
 
 def _start_idle_watchdog() -> None:
     """Cancel any existing idle watchdog and start a fresh one."""
-    old_task = _state.get("_idle_task")
+    old_task = _browser_state.get("_idle_task")
     if old_task and not old_task.done():
         old_task.cancel()
-    _state["_idle_task"] = asyncio.ensure_future(_idle_watchdog())
+    _browser_state["_idle_task"] = asyncio.ensure_future(
+        _idle_watchdog(),
+    )
 
 
 def _cancel_idle_watchdog() -> None:
     """Cancel the idle watchdog, if running."""
-    task = _state.get("_idle_task")
+    task = _browser_state.get("_idle_task")
     if task and not task.done():
         task.cancel()
-    _state["_idle_task"] = None
+    _browser_state["_idle_task"] = None
 
 
 # pylint: disable=R0912,R0915
 async def _action_start(
     headed: bool = False,
 ) -> ToolResponse:
-    # Check browser state based on mode
-    if _USE_SYNC_PLAYWRIGHT:
-        browser_exists = _state["_sync_browser"] is not None
-        current_headless = not _state.get("_sync_headless", True)
-    else:
-        browser_exists = _state["browser"] is not None
-        current_headless = _state["headless"]
+    # Force headless — Live View panel replaces visible window.
+    headed = False
+    _browser_state["headless"] = not headed
 
-    # If user asks for visible window (headed=True)
-    # but browser is already running headless, restart with headed
-    if browser_exists:
-        if headed and current_headless:
-            _cancel_idle_watchdog()
-            try:
-                await _action_stop()
-            except Exception:
-                pass
-        else:
+    ctx = _get_or_create_agent_ctx()
+    # Check if this agent already has a context
+    has_context = (
+        ctx._sync_context is not None
+        if _USE_SYNC_PLAYWRIGHT
+        else ctx.context is not None
+    )
+    if has_context:
+        return _tool_response(
+            json.dumps(
+                {"ok": True, "message": "Browser already running"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+    try:
+        ok = await _ensure_browser()
+        if not ok:
+            err = (
+                _browser_state.get("_last_browser_error")
+                or "Browser start failed"
+            )
             return _tool_response(
                 json.dumps(
-                    {"ok": True, "message": "Browser already running"},
+                    {"ok": False, "error": err},
                     ensure_ascii=False,
                     indent=2,
                 ),
             )
-    # Default: headless (background). Only headed=True (e.g. browser_visible skill) shows window.
-    _state["headless"] = not headed
-
-    try:
-        if _USE_SYNC_PLAYWRIGHT:
-            loop = asyncio.get_event_loop()
-            pw, browser, context = await loop.run_in_executor(
-                _get_executor(),
-                lambda: _sync_browser_launch(_state["headless"]),
-            )
-            _state["_sync_playwright"] = pw
-            _state["_sync_browser"] = browser
-            _state["_sync_context"] = context
-            _state["_sync_headless"] = not headed
-        else:
-            async_playwright = _ensure_playwright_async()
-            pw = await async_playwright().start()
-            use_default = not is_running_in_container() and os.environ.get(
-                "COPAW_BROWSER_USE_DEFAULT",
-                "1",
-            ).strip().lower() in ("1", "true", "yes")
-            default_kind, default_path = (
-                get_system_default_browser() if use_default else (None, None)
-            )
-            exe: Optional[str] = None
-            if default_kind == "chromium" and default_path:
-                exe = default_path
-            elif default_kind != "webkit":
-                exe = _chromium_executable_path()
-            if exe:
-                launch_kwargs = {"headless": _state["headless"]}
-                extra_args = _chromium_launch_args()
-                if extra_args:
-                    launch_kwargs["args"] = extra_args
-                launch_kwargs["executable_path"] = exe
-                pw_browser = await pw.chromium.launch(**launch_kwargs)
-            elif default_kind == "webkit" or sys.platform == "darwin":
-                pw_browser = await pw.webkit.launch(
-                    headless=_state["headless"],
-                )
-            else:
-                launch_kwargs = {"headless": _state["headless"]}
-                extra_args = _chromium_launch_args()
-                if extra_args:
-                    launch_kwargs["args"] = extra_args
-                pw_browser = await pw.chromium.launch(**launch_kwargs)
-            context = await pw_browser.new_context()
-            _attach_context_listeners(context)
-            _state["playwright"] = pw
-            _state["browser"] = pw_browser
-            _state["context"] = context
         _touch_activity()
-        _start_idle_watchdog()
+        await _notify_lifecycle(
+            "started",
+            agent_id=ctx.agent_id,
+        )
         msg = (
             "Browser started (visible window)"
-            if not _state["headless"]
+            if not _browser_state["headless"]
             else "Browser started"
         )
         return _tool_response(
@@ -915,10 +1518,10 @@ async def _action_start(
 
 
 async def _action_stop() -> ToolResponse:
-    _cancel_idle_watchdog()
+    agent_id = _get_agent_id()
+    ctx = _get_agent_ctx(agent_id)
 
-    # Check browser state based on mode
-    if not _is_browser_running():
+    if ctx is None:
         return _tool_response(
             json.dumps(
                 {"ok": True, "message": "Browser not running"},
@@ -927,40 +1530,27 @@ async def _action_stop() -> ToolResponse:
             ),
         )
 
-    if _USE_SYNC_PLAYWRIGHT:
-        # Close sync browser in thread pool
-        loop = asyncio.get_event_loop()
+    # Step 1: close this agent's context (auto-saves storage state)
+    try:
+        await _async_close_agent_context(agent_id)
+    except Exception as e:
+        return _tool_response(
+            json.dumps(
+                {"ok": False, "error": f"Browser stop failed: {e!s}"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+    await _notify_lifecycle("stopped", agent_id=agent_id)
+
+    # Step 2: if no agent contexts remain, stop shared browser
+    if not _agent_contexts:
+        _cancel_idle_watchdog()
         try:
-            await loop.run_in_executor(
-                _get_executor(),
-                _sync_browser_close,
-            )
-        except Exception as e:
-            return _tool_response(
-                json.dumps(
-                    {"ok": False, "error": f"Browser stop failed: {e!s}"},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-        finally:
-            _reset_browser_state()
-    else:
-        # Standard async mode
-        try:
-            await _state["browser"].close()
-            if _state["playwright"] is not None:
-                await _state["playwright"].stop()
-        except Exception as e:
-            return _tool_response(
-                json.dumps(
-                    {"ok": False, "error": f"Browser stop failed: {e!s}"},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            )
-        finally:
-            _reset_browser_state()
+            await _async_stop_browser_process()
+        except Exception:
+            pass
 
     return _tool_response(
         json.dumps(
@@ -982,7 +1572,9 @@ async def _action_open(url: str, page_id: str) -> ToolResponse:
             ),
         )
     if not await _ensure_browser():
-        err = _state.get("_last_browser_error") or "Browser not started"
+        err = (
+            _browser_state.get("_last_browser_error") or "Browser not started"
+        )
         return _tool_response(
             json.dumps(
                 {"ok": False, "error": err},
@@ -990,25 +1582,33 @@ async def _action_open(url: str, page_id: str) -> ToolResponse:
                 indent=2,
             ),
         )
-    try:
-        if _USE_SYNC_PLAYWRIGHT:
-            # Hybrid mode: create page in thread pool
-            loop = asyncio.get_event_loop()
-            # pylint: disable=unnecessary-lambda
-            page = await loop.run_in_executor(
-                _get_executor(),
-                lambda: _state["_sync_context"].new_page(),
-            )
-        else:
-            # Standard async mode
-            page = await _state["context"].new_page()
+    ctx = _get_or_create_agent_ctx()
 
-        _state["refs"][page_id] = {}
-        _state["console_logs"][page_id] = []
-        _state["network_requests"][page_id] = []
-        _state["pending_dialogs"][page_id] = []
-        _state["pending_file_choosers"][page_id] = []
-        _attach_page_listeners(page, page_id)
+    # Reuse existing page if page_id already exists (preserves
+    # sessionStorage and in-memory state like auth tokens).
+    if page_id in ctx.pages and ctx.pages[page_id]:
+        return await _action_navigate(url, page_id)
+
+    try:
+        ctx._creating_page = True
+        try:
+            if _USE_SYNC_PLAYWRIGHT:
+                loop = asyncio.get_event_loop()
+                page = await loop.run_in_executor(
+                    _get_executor(),
+                    lambda: ctx._sync_context.new_page(),
+                )
+            else:
+                page = await ctx.context.new_page()
+        finally:
+            ctx._creating_page = False
+
+        ctx.refs[page_id] = {}
+        ctx.console_logs[page_id] = []
+        ctx.network_requests[page_id] = []
+        ctx.pending_dialogs[page_id] = []
+        ctx.pending_file_choosers[page_id] = []
+        _attach_page_listeners(page, page_id, ctx)
 
         if _USE_SYNC_PLAYWRIGHT:
             loop = asyncio.get_event_loop()
@@ -1019,8 +1619,31 @@ async def _action_open(url: str, page_id: str) -> ToolResponse:
         else:
             await page.goto(url)
 
-        _state["pages"][page_id] = page
-        _state["current_page_id"] = page_id
+        # Restore sessionStorage from previous session (if any)
+        await _restore_session_storage(page, ctx)
+        # If sessionStorage contained auth tokens, the page may need
+        # a reload to pick them up (SPA init reads from storage).
+        if getattr(ctx, "_pending_session_storage", None):
+            actual_url = page.url
+            # Only reload if page didn't redirect (still on target)
+            if actual_url and actual_url.rstrip("/") == url.rstrip("/"):
+                try:
+                    if _USE_SYNC_PLAYWRIGHT:
+                        await _run_sync(page.reload)
+                    else:
+                        await page.reload()
+                except Exception:
+                    pass
+            ctx._pending_session_storage = []
+
+        ctx.pages[page_id] = page
+        ctx.current_page_id = page_id
+        await _notify_lifecycle(
+            "navigated",
+            url=url,
+            page_id=page_id,
+            agent_id=ctx.agent_id,
+        )
         return _tool_response(
             json.dumps(
                 {
@@ -1062,6 +1685,7 @@ async def _action_navigate(url: str, page_id: str) -> ToolResponse:
                 indent=2,
             ),
         )
+    ctx = _get_agent_ctx()
     try:
         if _USE_SYNC_PLAYWRIGHT:
             loop = asyncio.get_event_loop()
@@ -1071,7 +1695,14 @@ async def _action_navigate(url: str, page_id: str) -> ToolResponse:
             )
         else:
             await page.goto(url)
-        _state["current_page_id"] = page_id
+        if ctx:
+            ctx.current_page_id = page_id
+        await _notify_lifecycle(
+            "navigated",
+            url=page.url,
+            page_id=page_id,
+            agent_id=ctx.agent_id if ctx else "",
+        )
         return _tool_response(
             json.dumps(
                 {
@@ -1545,24 +2176,23 @@ async def _action_close(page_id: str) -> ToolResponse:
                 indent=2,
             ),
         )
+    ctx = _get_agent_ctx()
     try:
         if _USE_SYNC_PLAYWRIGHT:
             await _run_sync(page.close)
         else:
             await page.close()
-        del _state["pages"][page_id]
-        for key in (
-            "refs",
-            "refs_frame",
-            "console_logs",
-            "network_requests",
-            "pending_dialogs",
-            "pending_file_choosers",
-        ):
-            _state[key].pop(page_id, None)
-        if _state.get("current_page_id") == page_id:
-            remaining = list(_state["pages"].keys())
-            _state["current_page_id"] = remaining[0] if remaining else None
+        if ctx:
+            ctx.pages.pop(page_id, None)
+            ctx.refs.pop(page_id, None)
+            ctx.refs_frame.pop(page_id, None)
+            ctx.console_logs.pop(page_id, None)
+            ctx.network_requests.pop(page_id, None)
+            ctx.pending_dialogs.pop(page_id, None)
+            ctx.pending_file_choosers.pop(page_id, None)
+            if ctx.current_page_id == page_id:
+                remaining = list(ctx.pages.keys())
+                ctx.current_page_id = remaining[0] if remaining else None
         return _tool_response(
             json.dumps(
                 {"ok": True, "message": f"Closed page '{page_id}'"},
@@ -1574,6 +2204,369 @@ async def _action_close(page_id: str) -> ToolResponse:
         return _tool_response(
             json.dumps(
                 {"ok": False, "error": f"Close failed: {e!s}"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+
+async def _action_get_cookies(
+    cookies_url: str = "",
+    cookies_file: str = "",
+) -> ToolResponse:
+    """Export cookies from the current agent's BrowserContext."""
+    ctx = _get_agent_ctx()
+    if not ctx or not (ctx.context or ctx._sync_context):
+        return _tool_response(
+            json.dumps(
+                {"ok": False, "error": "Browser not started"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    try:
+        context = ctx._sync_context if _USE_SYNC_PLAYWRIGHT else ctx.context
+        if cookies_url:
+            if _USE_SYNC_PLAYWRIGHT:
+                cookies = await _run_sync(context.cookies, cookies_url)
+            else:
+                cookies = await context.cookies(cookies_url)
+        else:
+            if _USE_SYNC_PLAYWRIGHT:
+                cookies = await _run_sync(context.cookies)
+            else:
+                cookies = await context.cookies()
+        if cookies_file:
+            cookies_file = os.path.expanduser(cookies_file)
+            os.makedirs(os.path.dirname(cookies_file), exist_ok=True)
+            with open(cookies_file, "w", encoding="utf-8") as f:
+                json.dump(cookies, f, ensure_ascii=False, indent=2)
+            return _tool_response(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "count": len(cookies),
+                        "file": cookies_file,
+                        "message": (
+                            f"Saved {len(cookies)} cookies to"
+                            f" {cookies_file}"
+                        ),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": True,
+                    "count": len(cookies),
+                    "cookies": cookies,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    except Exception as e:
+        return _tool_response(
+            json.dumps(
+                {"ok": False, "error": f"Get cookies failed: {e!s}"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+
+async def _action_set_cookies(
+    cookies_json: str = "",
+    cookies_file: str = "",
+) -> ToolResponse:
+    """Import cookies into the current agent's BrowserContext."""
+    ctx = _get_agent_ctx()
+    if not ctx or not (ctx.context or ctx._sync_context):
+        return _tool_response(
+            json.dumps(
+                {"ok": False, "error": "Browser not started"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    cookies = None
+    if cookies_json:
+        cookies = _parse_json_param(cookies_json)
+        if not isinstance(cookies, list):
+            return _tool_response(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": (
+                            "cookies_json must be a JSON array of cookie"
+                            " objects"
+                        ),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+    elif cookies_file:
+        cookies_file = os.path.expanduser(cookies_file)
+        if not os.path.isfile(cookies_file):
+            return _tool_response(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"Cookie file not found: {cookies_file}",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        try:
+            with open(cookies_file, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+        except Exception as e:
+            return _tool_response(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"Failed to read cookie file: {e!s}",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+    if not cookies:
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "Provide cookies_json or cookies_file"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    try:
+        context = ctx._sync_context if _USE_SYNC_PLAYWRIGHT else ctx.context
+        if _USE_SYNC_PLAYWRIGHT:
+            await _run_sync(context.add_cookies, cookies)
+        else:
+            await context.add_cookies(cookies)
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": True,
+                    "count": len(cookies),
+                    "message": f"Set {len(cookies)} cookies",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    except Exception as e:
+        return _tool_response(
+            json.dumps(
+                {"ok": False, "error": f"Set cookies failed: {e!s}"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+
+async def _action_save_storage_state(
+    cookies_file: str = "",
+) -> ToolResponse:
+    """Save full storage state (cookies + localStorage) to file."""
+    ctx = _get_agent_ctx()
+    if not ctx or not (ctx.context or ctx._sync_context):
+        return _tool_response(
+            json.dumps(
+                {"ok": False, "error": "Browser not started"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    if not cookies_file:
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "cookies_file required for save_storage_state",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    try:
+        cookies_file = os.path.expanduser(cookies_file)
+        os.makedirs(os.path.dirname(cookies_file), exist_ok=True)
+        context = ctx._sync_context if _USE_SYNC_PLAYWRIGHT else ctx.context
+        if _USE_SYNC_PLAYWRIGHT:
+            state = await _run_sync(context.storage_state)
+        else:
+            state = await context.storage_state()
+        with open(cookies_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        n_cookies = len(state.get("cookies", []))
+        n_origins = len(state.get("origins", []))
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": True,
+                    "file": cookies_file,
+                    "cookies_count": n_cookies,
+                    "origins_count": n_origins,
+                    "message": (
+                        f"Saved storage state ({n_cookies} cookies,"
+                        f" {n_origins} origins with localStorage)"
+                        f" to {cookies_file}"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    except Exception as e:
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": f"Save storage state failed: {e!s}",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+
+async def _action_load_storage_state(
+    cookies_file: str = "",
+) -> ToolResponse:
+    """Re-create agent BrowserContext with saved storage state."""
+    if not cookies_file:
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "cookies_file required for load_storage_state"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    cookies_file = os.path.expanduser(cookies_file)
+    if not os.path.isfile(cookies_file):
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": f"Storage state file not found: {cookies_file}",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    # Ensure browser process is running
+    if not _is_browser_running():
+        ok = await _ensure_browser()
+        if not ok:
+            return _tool_response(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "Failed to start browser",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+    agent_id = _get_agent_id()
+    # Close existing context for this agent (if any)
+    ctx = _get_agent_ctx(agent_id)
+    if ctx and (ctx.context or ctx._sync_context):
+        for page in list(ctx.pages.values()):
+            try:
+                if _USE_SYNC_PLAYWRIGHT:
+                    page.close()
+                else:
+                    await page.close()
+            except Exception:
+                pass
+        ctx.pages.clear()
+        ctx.refs.clear()
+        ctx.refs_frame.clear()
+        ctx.console_logs.clear()
+        ctx.network_requests.clear()
+        ctx.pending_dialogs.clear()
+        ctx.pending_file_choosers.clear()
+        ctx.current_page_id = None
+        ctx.page_counter = 0
+        if _USE_SYNC_PLAYWRIGHT and ctx._sync_context:
+            try:
+                ctx._sync_context.close()
+            except Exception:
+                pass
+            ctx._sync_context = None
+        elif ctx.context:
+            try:
+                await ctx.context.close()
+            except Exception:
+                pass
+            ctx.context = None
+    # Create new context with storage_state
+    try:
+        ctx = _get_or_create_agent_ctx(agent_id)
+        if _USE_SYNC_PLAYWRIGHT:
+            browser = _browser_state["_sync_browser"]
+            loop = asyncio.get_event_loop()
+            context = await loop.run_in_executor(
+                _get_executor(),
+                lambda: browser.new_context(
+                    storage_state=cookies_file,
+                ),
+            )
+            ctx._sync_context = context
+        else:
+            browser = _browser_state["browser"]
+            context = await browser.new_context(
+                storage_state=cookies_file,
+            )
+            ctx.context = context
+        _attach_context_listeners(context, ctx)
+        _touch_activity(agent_id)
+        # Read state info for response
+        with open(cookies_file, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        n_cookies = len(state.get("cookies", []))
+        n_origins = len(state.get("origins", []))
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": True,
+                    "file": cookies_file,
+                    "cookies_count": n_cookies,
+                    "origins_count": n_origins,
+                    "message": (
+                        f"Loaded storage state ({n_cookies} cookies,"
+                        f" {n_origins} origins) from {cookies_file}."
+                        f" Navigate to target URL now."
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    except Exception as e:
+        return _tool_response(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": f"Load storage state failed: {e!s}",
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -1615,10 +2608,12 @@ async def _action_snapshot(
             interactive=False,
             compact=False,
         )
-        _state["refs"][page_id] = refs
-        _state["refs_frame"][page_id] = (
-            frame_selector.strip() if frame_selector else ""
-        )
+        ctx = _get_agent_ctx()
+        if ctx:
+            ctx.refs[page_id] = refs
+            ctx.refs_frame[page_id] = (
+                frame_selector.strip() if frame_selector else ""
+            )
         out = {
             "ok": True,
             "snapshot": snapshot,
@@ -1824,7 +2819,8 @@ async def _action_console_messages(
                 indent=2,
             ),
         )
-    logs = _state["console_logs"].get(page_id, [])
+    ctx = _get_agent_ctx()
+    logs = ctx.console_logs.get(page_id, []) if ctx else []
     filtered = (
         [m for m in logs if order.index(m["level"]) <= idx]
         if level in order
@@ -1869,7 +2865,8 @@ async def _action_handle_dialog(
                 indent=2,
             ),
         )
-    dialogs = _state["pending_dialogs"].get(page_id, [])
+    ctx = _get_agent_ctx()
+    dialogs = ctx.pending_dialogs.get(page_id, []) if ctx else []
     if not dialogs:
         return _tool_response(
             json.dumps(
@@ -1927,7 +2924,8 @@ async def _action_file_upload(page_id: str, paths_json: str) -> ToolResponse:
     if not isinstance(paths, list):
         paths = []
     try:
-        choosers = _state["pending_file_choosers"].get(page_id, [])
+        ctx = _get_agent_ctx()
+        choosers = ctx.pending_file_choosers.get(page_id, []) if ctx else []
         if not choosers:
             return _tool_response(
                 json.dumps(
@@ -1994,7 +2992,8 @@ async def _action_fill_form(page_id: str, fields_json: str) -> ToolResponse:
         )
     refs = _get_refs(page_id)
     # Use last snapshot's frame so fill_form works after iframe snapshot
-    frame = _state["refs_frame"].get(page_id, "")
+    ctx = _get_agent_ctx()
+    frame = ctx.refs_frame.get(page_id, "") if ctx else ""
     try:
         for f in fields:
             ref = (f.get("ref") or "").strip()
@@ -2189,7 +3188,8 @@ async def _action_network_requests(
                 indent=2,
             ),
         )
-    requests = _state["network_requests"].get(page_id, [])
+    ctx = _get_agent_ctx()
+    requests = ctx.network_requests.get(page_id, []) if ctx else []
     if not include_static:
         static = ("image", "stylesheet", "font", "media")
         requests = [r for r in requests if r.get("resourceType") not in static]
@@ -2511,8 +3511,9 @@ async def _action_tabs(  # pylint: disable=too-many-return-statements
                 indent=2,
             ),
         )
-    pages = _state["pages"]
-    page_ids = list(pages.keys())
+    ctx = _get_agent_ctx()
+    agent_pages = ctx.pages if ctx else {}
+    page_ids = list(agent_pages.keys())
     if tab_action == "list":
         return _tool_response(
             json.dumps(
@@ -2522,55 +3523,45 @@ async def _action_tabs(  # pylint: disable=too-many-return-statements
             ),
         )
     if tab_action == "new":
-        if _USE_SYNC_PLAYWRIGHT:
-            if not _state["_sync_context"]:
-                ok = await _ensure_browser()
-                if not ok:
-                    err = (
-                        _state.get("_last_browser_error")
-                        or "Browser not started"
-                    )
-                    return _tool_response(
-                        json.dumps(
-                            {"ok": False, "error": err},
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
-        else:
-            if not _state["context"]:
-                ok = await _ensure_browser()
-                if not ok:
-                    err = (
-                        _state.get("_last_browser_error")
-                        or "Browser not started"
-                    )
-                    return _tool_response(
-                        json.dumps(
-                            {"ok": False, "error": err},
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    )
+        ok = await _ensure_browser()
+        if not ok:
+            err = (
+                _browser_state.get("_last_browser_error")
+                or "Browser not started"
+            )
+            return _tool_response(
+                json.dumps(
+                    {"ok": False, "error": err},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        ctx = _get_or_create_agent_ctx()
         try:
-            if _USE_SYNC_PLAYWRIGHT:
-                page = await _run_sync(_state["_sync_context"].new_page)
-            else:
-                page = await _state["context"].new_page()
-            new_id = _next_page_id()
-            _state["refs"][new_id] = {}
-            _state["console_logs"][new_id] = []
-            _state["network_requests"][new_id] = []
-            _state["pending_dialogs"][new_id] = []
-            _attach_page_listeners(page, new_id)
-            _state["pages"][new_id] = page
-            _state["current_page_id"] = new_id
+            ctx._creating_page = True
+            try:
+                if _USE_SYNC_PLAYWRIGHT:
+                    page = await _run_sync(
+                        ctx._sync_context.new_page,
+                    )
+                else:
+                    page = await ctx.context.new_page()
+            finally:
+                ctx._creating_page = False
+            new_id = _next_page_id(ctx)
+            ctx.refs[new_id] = {}
+            ctx.console_logs[new_id] = []
+            ctx.network_requests[new_id] = []
+            ctx.pending_dialogs[new_id] = []
+            _attach_page_listeners(page, new_id, ctx)
+            ctx.pages[new_id] = page
+            ctx.current_page_id = new_id
             return _tool_response(
                 json.dumps(
                     {
                         "ok": True,
                         "page_id": new_id,
-                        "tabs": list(_state["pages"].keys()),
+                        "tabs": list(ctx.pages.keys()),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -2589,7 +3580,8 @@ async def _action_tabs(  # pylint: disable=too-many-return-statements
         return await _action_close(target_id)
     if tab_action == "select":
         target_id = page_ids[index] if 0 <= index < len(page_ids) else page_id
-        _state["current_page_id"] = target_id
+        if ctx:
+            ctx.current_page_id = target_id
         return _tool_response(
             json.dumps(
                 {

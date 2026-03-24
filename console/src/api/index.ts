@@ -22,6 +22,7 @@ import { tokenUsageApi } from "./modules/tokenUsage";
 import { toolsApi } from "./modules/tools";
 import { securityApi } from "./modules/security";
 import { userTimezoneApi } from "./modules/userTimezone";
+import { browserApi } from "./modules/browser";
 
 export const api = {
   // Root
@@ -76,9 +77,13 @@ export const api = {
 
   // User Timezone
   ...userTimezoneApi,
+
+  // Browser Live View
+  ...browserApi,
 };
 
 export default api;
 
 // Export individual APIs for direct access
 export { agentsApi };
+export { browserApi };

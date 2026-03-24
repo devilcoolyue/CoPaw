@@ -7,7 +7,11 @@ import {
 } from "@agentscope-ai/chat";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Modal, Result, message } from "antd";
-import { ExclamationCircleOutlined, SettingOutlined } from "@ant-design/icons";
+import {
+  ExclamationCircleOutlined,
+  GlobalOutlined,
+  SettingOutlined,
+} from "@ant-design/icons";
 import { SparkCopyLine } from "@agentscope-ai/icons";
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -28,6 +32,8 @@ import "./index.module.less";
 import { Tooltip } from "antd";
 import { IconButton } from "@agentscope-ai/design";
 import { SparkAttachmentLine } from "@agentscope-ai/icons";
+import BrowserLiveView from "../../components/BrowserLiveView";
+import { browserApi } from "../../api/modules/browser";
 
 type CopyableContent = {
   type?: string;
@@ -256,6 +262,13 @@ export default function ChatPage() {
   const prevChatIdRef = useRef<string | undefined>(undefined);
   const runtimeLoadingBridgeRef = useRef<RuntimeLoadingBridgeApi | null>(null);
 
+  // Browser live-view panel state
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserRunning, setBrowserRunning] = useState(false);
+  const [panelWidth, setPanelWidth] = useState(480);
+  const resizingRef = useRef(false);
+  const userClosedBrowserRef = useRef(false);
+
   const isComposingRef = useRef(false);
   const isChatActiveRef = useRef(false);
   isChatActiveRef.current =
@@ -381,6 +394,62 @@ export default function ChatPage() {
     }
     prevSelectedAgentRef.current = selectedAgent;
   }, [selectedAgent]);
+
+  // Poll browser status to auto-show/hide the live-view panel
+  useEffect(() => {
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await browserApi.getStatus(selectedAgent);
+        if (!active) return;
+        setBrowserRunning(res.running);
+        if (res.running) {
+          // Don't reopen if user manually closed the panel
+          if (!userClosedBrowserRef.current) {
+            setBrowserOpen(true);
+          }
+        } else {
+          // Reset user-close flag when browser stops,
+          // so next browser start will auto-show the panel
+          userClosedBrowserRef.current = false;
+        }
+      } catch {
+        // ignore
+      }
+    };
+    poll();
+    const id = setInterval(poll, 2000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, [selectedAgent]);
+
+  // Drag-resize handler for browser panel
+  const startResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      resizingRef.current = true;
+      const startX = e.clientX;
+      const startWidth = panelWidth;
+
+      const onMove = (ev: globalThis.MouseEvent) => {
+        if (!resizingRef.current) return;
+        const delta = startX - ev.clientX;
+        setPanelWidth(Math.max(360, startWidth + delta));
+      };
+
+      const onUp = () => {
+        resizingRef.current = false;
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+      };
+
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [panelWidth],
+  );
 
   const getSessionListWrapped = useCallback(async () => {
     const sessions = await sessionApi.getSessionList();
@@ -843,22 +912,92 @@ export default function ChatPage() {
     } as unknown as IAgentScopeRuntimeWebUIOptions;
   }, [wrappedSessionApi, customFetch, copyResponse, t, isDark]);
 
+  const toggleBrowser = useCallback(() => {
+    if (browserOpen) {
+      userClosedBrowserRef.current = true;
+      setBrowserOpen(false);
+    } else {
+      userClosedBrowserRef.current = false;
+      setBrowserOpen(true);
+    }
+  }, [browserOpen]);
+
   return (
     <div
       style={{
         height: "100%",
         width: "100%",
         display: "flex",
-        flexDirection: "column",
+        flexDirection: "row",
       }}
     >
-      <div style={{ flex: 1, minHeight: 0 }}>
-        <AgentScopeRuntimeWebUI
-          ref={chatRef}
-          key={refreshKey}
-          options={options}
-        />
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0,
+          display: "flex",
+          flexDirection: "column",
+          position: "relative",
+        }}
+      >
+        <div style={{ flex: 1, minHeight: 0 }}>
+          <AgentScopeRuntimeWebUI
+            ref={chatRef}
+            key={refreshKey}
+            options={options}
+          />
+        </div>
+        {browserRunning && (
+          <Tooltip
+            title={
+              browserOpen
+                ? t("chat.hideBrowser", "Hide browser")
+                : t("chat.showBrowser", "Show browser")
+            }
+          >
+            <Button
+              type="text"
+              icon={<GlobalOutlined />}
+              onClick={toggleBrowser}
+              style={{
+                position: "absolute",
+                top: 8,
+                right: 8,
+                zIndex: 10,
+                opacity: browserOpen ? 0.9 : 0.6,
+                color: browserOpen
+                  ? "var(--ant-color-primary, #1677ff)"
+                  : undefined,
+              }}
+            />
+          </Tooltip>
+        )}
       </div>
+
+      {browserOpen && (
+        <>
+          <div
+            className="browserResizeHandle"
+            onMouseDown={startResize}
+            style={{
+              width: 4,
+              cursor: "col-resize",
+              background: "var(--ant-color-border, #d9d9d9)",
+              flexShrink: 0,
+            }}
+          />
+          <div
+            style={{
+              width: panelWidth,
+              minWidth: 360,
+              flexShrink: 0,
+              height: "100%",
+            }}
+          >
+            <BrowserLiveView agentId={selectedAgent} />
+          </div>
+        </>
+      )}
 
       <Modal
         open={showModelPrompt}
