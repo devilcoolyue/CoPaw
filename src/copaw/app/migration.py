@@ -12,15 +12,44 @@ from ..config.config import (
     AgentProfileConfig,
     AgentProfileRef,
     AgentsConfig,
-    AgentsRunningConfig,
     AgentsLLMRoutingConfig,
+    AgentsRunningConfig,
+    ChannelConfig,
+    HeartbeatConfig,
+    MCPConfig,
+    build_qa_agent_tools_config,
+    save_agent_config,
 )
-from ..constant import WORKING_DIR
+from ..constant import (
+    BUILTIN_QA_AGENT_ID,
+    BUILTIN_QA_AGENT_NAME,
+    BUILTIN_QA_AGENT_SKILL_NAMES,
+    WORKING_DIR,
+)
 from ..config.utils import load_config, save_config
 
 logger = logging.getLogger(__name__)
 
-_LEGACY_DEFAULT_WORKING_DIR = Path("~/.copaw").expanduser().resolve()
+# Workspace items to migrate: (name, is_directory)
+_WORKSPACE_ITEMS_TO_MIGRATE = [
+    # Directories
+    ("sessions", True),
+    ("memory", True),
+    ("active_skills", True),
+    ("customized_skills", True),
+    # Files
+    ("chats.json", False),
+    ("jobs.json", False),
+    ("feishu_receive_ids.json", False),
+    ("dingtalk_session_webhooks.json", False),
+    # Markdown files
+    ("AGENTS.md", False),
+    ("SOUL.md", False),
+    ("PROFILE.md", False),
+    ("HEARTBEAT.md", False),
+    ("MEMORY.md", False),
+    ("BOOTSTRAP.md", False),
+]
 
 
 def migrate_legacy_workspace_to_default_agent() -> bool:
@@ -29,7 +58,7 @@ def migrate_legacy_workspace_to_default_agent() -> bool:
     This function:
     1. Checks if migration is needed
     2. Creates default agent workspace
-    3. Migrates sessions, memory, and markdown files
+    3. Migrates legacy workspace files and directories
     4. Creates agent.json with legacy configuration
     5. Updates root config.json to new structure
 
@@ -121,88 +150,11 @@ def migrate_legacy_workspace_to_default_agent() -> bool:
         )
     logger.info(f"Created agent config: {agent_config_path}")
 
-    # Migrate existing workspace files from legacy default working dir.
-    # When COPAW_WORKING_DIR is customized, historical data may still exist
-    # under "~/.copaw".
-    old_workspace = _LEGACY_DEFAULT_WORKING_DIR
-
     migrated_items = []
 
-    # Migrate sessions directory
-    _migrate_workspace_item(
-        old_workspace / "sessions",
-        default_workspace / "sessions",
-        "sessions",
-        migrated_items,
-    )
-
-    # Migrate memory directory
-    _migrate_workspace_item(
-        old_workspace / "memory",
-        default_workspace / "memory",
-        "memory",
-        migrated_items,
-    )
-
-    # Migrate chats.json
-    _migrate_workspace_item(
-        old_workspace / "chats.json",
-        default_workspace / "chats.json",
-        "chats.json",
-        migrated_items,
-    )
-
-    # Migrate jobs.json
-    _migrate_workspace_item(
-        old_workspace / "jobs.json",
-        default_workspace / "jobs.json",
-        "jobs.json",
-        migrated_items,
-    )
-
-    # Migrate markdown files
-    for md_file in [
-        "AGENTS.md",
-        "SOUL.md",
-        "PROFILE.md",
-        "HEARTBEAT.md",
-        "MEMORY.md",
-        "BOOTSTRAP.md",
-    ]:
-        _migrate_workspace_item(
-            old_workspace / md_file,
-            default_workspace / md_file,
-            md_file,
-            migrated_items,
-        )
-
-    # Migrate skills directories
-    _migrate_workspace_item(
-        old_workspace / "active_skills",
-        default_workspace / "active_skills",
-        "active_skills",
-        migrated_items,
-    )
-
-    _migrate_workspace_item(
-        old_workspace / "customized_skills",
-        default_workspace / "customized_skills",
-        "customized_skills",
-        migrated_items,
-    )
-
-    # Migrate channel-specific configuration files
-    _migrate_workspace_item(
-        old_workspace / "feishu_receive_ids.json",
-        default_workspace / "feishu_receive_ids.json",
-        "feishu_receive_ids.json",
-        migrated_items,
-    )
-
-    _migrate_workspace_item(
-        old_workspace / "dingtalk_session_webhooks.json",
-        default_workspace / "dingtalk_session_webhooks.json",
-        "dingtalk_session_webhooks.json",
+    _migrate_workspace_items_from_source(
+        WORKING_DIR,
+        default_workspace,
         migrated_items,
     )
 
@@ -281,6 +233,27 @@ def _migrate_workspace_item(
         logger.warning(f"Failed to migrate {item_name}: {e}")
 
 
+def _migrate_workspace_items_from_source(
+    source_dir: Path,
+    target_dir: Path,
+    migrated_items: list,
+) -> None:
+    """Migrate all workspace items from a single source directory.
+
+    Args:
+        source_dir: Source directory (e.g., ~/.copaw or WORKING_DIR)
+        target_dir: Target directory (e.g., workspaces/default/)
+        migrated_items: List to append migrated item names
+    """
+    for item_name, _ in _WORKSPACE_ITEMS_TO_MIGRATE:
+        _migrate_workspace_item(
+            source_dir / item_name,
+            target_dir / item_name,
+            item_name,
+            migrated_items,
+        )
+
+
 def ensure_default_agent_exists() -> None:
     """Ensure that the default agent exists in config.
 
@@ -346,3 +319,144 @@ def ensure_default_agent_exists() -> None:
         logger.info(
             f"Created default agent with workspace: {default_workspace}",
         )
+
+
+def _other_agent_owns_workspace(
+    profiles: dict[str, AgentProfileRef],
+    workspace: Path,
+    builtin_id: str,
+) -> str | None:
+    """If another profile's workspace resolves to ``workspace``, return its id.
+
+    Prevents creating the builtin QA profile on the canonical path
+    ``workspaces/<builtin_id>/`` when a user already assigned that directory
+    to a different agent: ``save_agent_config`` would overwrite their
+    ``agent.json``.
+    """
+    try:
+        target = workspace.resolve()
+    except OSError:
+        target = workspace.expanduser()
+    for aid, ref in profiles.items():
+        if aid == builtin_id:
+            continue
+        other = Path(ref.workspace_dir).expanduser()
+        try:
+            other_res = other.resolve()
+        except OSError:
+            other_res = other
+        if other_res == target:
+            return aid
+    return None
+
+
+def ensure_qa_agent_exists() -> None:
+    """Ensure the builtin QA agent profile and workspace exist.
+
+    On **first creation** only, ``active_skills`` is seeded from
+    ``BUILTIN_QA_AGENT_SKILL_NAMES`` (e.g. ``guidance``,
+    ``copaw_source_index``), and built-in tools are restricted (see
+    ``build_qa_agent_tools_config``).
+    After that, the user may change skills and tools freely; we do not
+    overwrite their choices on later startups.
+
+    If the canonical QA workspace path is already used by another agent id,
+    builtin creation is **skipped** (with a warning) so that workspace's
+    ``agent.json`` is not overwritten.
+    """
+    from .routers.agents import _initialize_agent_workspace
+
+    config = load_config()
+    qa_id = BUILTIN_QA_AGENT_ID
+
+    if qa_id in config.agents.profiles:
+        agent_ref = config.agents.profiles[qa_id]
+        qa_workspace = Path(agent_ref.workspace_dir).expanduser()
+        agent_existed = True
+    else:
+        qa_workspace = Path(
+            f"{WORKING_DIR}/workspaces/{qa_id}",
+        ).expanduser()
+        agent_existed = False
+
+    qa_workspace.mkdir(parents=True, exist_ok=True)
+
+    chats_file = qa_workspace / "chats.json"
+    if not chats_file.exists():
+        with open(chats_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {"version": 1, "chats": []},
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        logger.debug("Created chats.json for QA agent")
+
+    jobs_file = qa_workspace / "jobs.json"
+    if not jobs_file.exists():
+        with open(jobs_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {"version": 1, "jobs": []},
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        logger.debug("Created jobs.json for QA agent")
+
+    if agent_existed:
+        return
+
+    other_id = _other_agent_owns_workspace(
+        config.agents.profiles,
+        qa_workspace,
+        qa_id,
+    )
+    if other_id is not None:
+        logger.warning(
+            "Skipping builtin QA profile %r: workspace %s is already used by "
+            "agent %r. Point that agent to another directory or remove it "
+            "from config before the builtin QA slot can be created.",
+            qa_id,
+            qa_workspace,
+            other_id,
+        )
+        return
+
+    logger.info("Creating builtin QA agent...")
+    qa_skill_list = list(BUILTIN_QA_AGENT_SKILL_NAMES)
+
+    language = config.agents.language or "zh"
+    agent_config = AgentProfileConfig(
+        id=qa_id,
+        name=BUILTIN_QA_AGENT_NAME,
+        description=(
+            "Builtin Q&A helper for CoPaw setup, local config under "
+            "COPAW_WORKING_DIR, and documentation. Prefer reading files "
+            "before answering; use absolute paths for code outside this "
+            "workspace."
+        ),
+        workspace_dir=str(qa_workspace),
+        language=language,
+        channels=ChannelConfig(),
+        mcp=MCPConfig(),
+        heartbeat=HeartbeatConfig(),
+        tools=build_qa_agent_tools_config(),
+    )
+
+    _initialize_agent_workspace(
+        qa_workspace,
+        agent_config,
+        active_skill_names=qa_skill_list,
+        builtin_qa_md_seed=True,
+    )
+
+    config.agents.profiles[qa_id] = AgentProfileRef(
+        id=qa_id,
+        workspace_dir=str(qa_workspace),
+    )
+    save_config(config)
+    save_agent_config(qa_id, agent_config)
+    logger.info(
+        "Created builtin QA agent with workspace: %s",
+        qa_workspace,
+    )

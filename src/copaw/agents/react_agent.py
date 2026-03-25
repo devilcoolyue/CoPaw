@@ -22,7 +22,11 @@ from pydantic import BaseModel
 from .command_handler import CommandHandler
 from .hooks import BootstrapHook, MemoryCompactionHook
 from .model_factory import create_model_and_formatter
-from .prompt import build_system_prompt_from_working_dir
+from .prompt import (
+    build_multimodal_hint,
+    build_system_prompt_from_working_dir,
+    get_active_model_supports_multimodal,
+)
 from .skills_manager import (
     ensure_skills_initialized,
     get_working_skills_dir,
@@ -213,17 +217,26 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
             "get_token_usage": get_token_usage,
         }
 
+        multimodal = get_active_model_supports_multimodal()
+
         # Register only enabled tools
         for tool_name, tool_func in tool_functions.items():
             # If tool not in config, enable by default (backward compatibility)
-            if enabled_tools.get(tool_name, True):
-                toolkit.register_tool_function(
-                    tool_func,
-                    namesake_strategy=namesake_strategy,
-                )
-                logger.debug("Registered tool: %s", tool_name)
-            else:
+            if not enabled_tools.get(tool_name, True):
                 logger.debug("Skipped disabled tool: %s", tool_name)
+                continue
+
+            if tool_name == "view_image" and not multimodal:
+                logger.debug(
+                    "Skipped view_image — model does not support multimodal",
+                )
+                continue
+
+            toolkit.register_tool_function(
+                tool_func,
+                namesake_strategy=namesake_strategy,
+            )
+            logger.debug("Registered tool: %s", tool_name)
 
         return toolkit
 
@@ -267,12 +280,29 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
             else None
         )
 
+        # Check if heartbeat is enabled in agent config
+        heartbeat_enabled = False
+        if (
+            hasattr(self._agent_config, "heartbeat")
+            and self._agent_config.heartbeat is not None
+        ):
+            heartbeat_enabled = self._agent_config.heartbeat.enabled
+
         sys_prompt = build_system_prompt_from_working_dir(
             working_dir=self._workspace_dir,
             agent_id=agent_id,
+            heartbeat_enabled=heartbeat_enabled,
         )
+        logger.debug("System prompt:\n%s", sys_prompt)
+
+        # Inject multimodal capability awareness
+        multimodal_hint = build_multimodal_hint()
+        if multimodal_hint:
+            sys_prompt = sys_prompt + "\n\n" + multimodal_hint
+
         if self._env_context is not None:
             sys_prompt = sys_prompt + "\n\n" + self._env_context
+
         return sys_prompt
 
     def _setup_memory_manager(
@@ -414,12 +444,12 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
                         client_name,
                     )
             except Exception as e:  # pylint: disable=broad-except
-                logger.exception(
-                    "Unexpected error registering MCP client '%s': %s",
+                logger.warning(
+                    "Failed to register MCP client '%s', skipping: %s",
                     client_name,
                     e,
+                    exc_info=True,
                 )
-                raise
 
     async def _recover_mcp_client(self, client: Any) -> Any | None:
         """Recover MCP client from broken session and return healthy client."""
@@ -545,17 +575,41 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
 
     _MEDIA_BLOCK_TYPES = {"image", "audio", "video"}
 
+    def _proactive_strip_media_blocks(self) -> int:
+        """Proactively strip media blocks from memory before model call.
+
+        Only called when the active model does not support multimodal.
+        Returns the number of blocks stripped.
+        """
+        return self._strip_media_blocks_from_memory()
+
     async def _reasoning(
         self,
         tool_choice: Literal["auto", "none", "required"] | None = None,
     ) -> Msg:
-        """Override reasoning with media-block fallback.
+        """Override reasoning with proactive media filtering.
 
-        If the model call fails with a bad-request error and memory
-        contains media blocks (image/audio/video), strip them all and
-        retry once.  Calls ``super()._reasoning`` to keep the
-        ToolGuardMixin interception active.
+        1. Proactive layer: if the model does not support
+           multimodal, strip media blocks *before* calling.
+        2. Passive layer: if the model call still fails with a
+           bad-request / media error, strip remaining blocks and retry.
+        3. If the model IS marked as multimodal but still errors on
+           media, log a warning about possibly inaccurate capability flag.
+
+        Calls ``super()._reasoning`` to keep the ToolGuardMixin
+        interception active.
         """
+        # --- Proactive filtering layer ---
+        if not get_active_model_supports_multimodal():
+            n = self._proactive_strip_media_blocks()
+            if n > 0:
+                logger.warning(
+                    "Proactively stripped %d media block(s) - "
+                    "model does not support multimodal.",
+                    n,
+                )
+
+        # --- Passive fallback layer (existing logic) ---
         try:
             return await super()._reasoning(tool_choice=tool_choice)
         except Exception as e:
@@ -565,6 +619,15 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
             n_stripped = self._strip_media_blocks_from_memory()
             if n_stripped == 0:
                 raise
+
+            # If the model is marked as multimodal but still
+            # errored, the capability flag may be wrong.
+            if get_active_model_supports_multimodal():
+                logger.warning(
+                    "Model marked multimodal but "
+                    "rejected media. "
+                    "Capability flag may be wrong.",
+                )
 
             logger.warning(
                 "_reasoning failed (%s). "
@@ -575,24 +638,147 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
             return await super()._reasoning(tool_choice=tool_choice)
 
     async def _summarizing(self) -> Msg:
-        """Override summarizing with the same media-block fallback."""
+        """Override summarizing with proactive media filtering,
+        passive fallback, and tool_use block filtering.
+
+        1. Proactive layer: if the model does not support multimodal,
+           strip media blocks *before* calling the model.
+        2. Passive layer: if the model call still fails with a
+           bad-request / media error, strip remaining blocks and retry.
+        3. If the model IS marked as multimodal but still errors on
+           media, log a warning about possibly inaccurate capability flag.
+
+        Some models (e.g. kimi-k2.5) generate tool_use blocks even when
+        no tools are provided.  We set ``_in_summarizing`` so that
+        ``print`` can strip tool_use blocks from streaming chunks.
+        """
+        # --- Proactive filtering layer ---
+        if not get_active_model_supports_multimodal():
+            n = self._proactive_strip_media_blocks()
+            if n > 0:
+                logger.warning(
+                    "Proactively stripped %d media block(s) - "
+                    "model does not support multimodal.",
+                    n,
+                )
+
+        # --- Passive fallback layer ---
+        self._in_summarizing = True
         try:
-            return await super()._summarizing()
-        except Exception as e:
-            if not self._is_bad_request_or_media_error(e):
-                raise
+            try:
+                msg = await super()._summarizing()
+            except Exception as e:
+                if not self._is_bad_request_or_media_error(e):
+                    raise
 
-            n_stripped = self._strip_media_blocks_from_memory()
-            if n_stripped == 0:
-                raise
+                n_stripped = self._strip_media_blocks_from_memory()
+                if n_stripped == 0:
+                    raise
 
-            logger.warning(
-                "_summarizing failed (%s). "
-                "Stripped %d media block(s) from memory, retrying.",
-                e,
-                n_stripped,
+                if get_active_model_supports_multimodal():
+                    logger.warning(
+                        "Model marked multimodal but "
+                        "rejected media. "
+                        "Capability flag may be wrong.",
+                    )
+
+                logger.warning(
+                    "_summarizing failed (%s). "
+                    "Stripped %d media block(s) from memory, retrying.",
+                    e,
+                    n_stripped,
+                )
+                msg = await super()._summarizing()
+        finally:
+            self._in_summarizing = False
+
+        return self._strip_tool_use_from_msg(msg)
+
+    async def print(
+        self,
+        msg: Msg,
+        last: bool = True,
+        speech: Any = None,
+    ) -> None:
+        """Filter tool_use blocks during _summarizing before they hit the
+        message queue, preventing the frontend from briefly rendering
+        phantom tool calls that will never be executed.
+
+        On the *final* streaming event (``last=True``), append the
+        round-end notice so users see it immediately instead of only
+        after a page refresh.  Intermediate events that become empty
+        after filtering are silently skipped to avoid blank UI flashes.
+        """
+
+        if not getattr(self, "_in_summarizing", False):
+            return await super().print(msg, last, speech=speech)
+
+        original = msg.content
+        modified = False
+
+        if isinstance(original, list):
+            filtered = [
+                b
+                for b in original
+                if not (isinstance(b, dict) and b.get("type") == "tool_use")
+            ]
+            if not filtered and not last:
+                return
+            if len(filtered) != len(original) or last:
+                msg.content = filtered
+                if last:
+                    msg.content.append(
+                        {"type": "text", "text": self._ROUND_END_NOTICE},
+                    )
+                modified = True
+        elif isinstance(original, str) and last:
+            msg.content = original + self._ROUND_END_NOTICE
+            modified = True
+        if modified:
+            try:
+                return await super().print(msg, last, speech=speech)
+            finally:
+                msg.content = original
+        return await super().print(msg, last, speech=speech)
+
+    _ROUND_END_NOTICE = (
+        "\n\n---\n"
+        "本轮调用已达最大次数，回复已终止，请继续输入。\n"
+        "Maximum iterations reached for this round. "
+        "Please send a new message to continue."
+    )
+
+    @staticmethod
+    def _strip_tool_use_from_msg(msg: Msg) -> Msg:
+        """Remove tool_use blocks from a message and append a user notice.
+
+        When _summarizing is called without tools, some models still
+        return tool_use blocks.  Those blocks can never be executed, so
+        strip them and append a bilingual notice telling the user this
+        round of calls has ended.
+        """
+        if isinstance(msg.content, str):
+            msg.content += CoPawAgent._ROUND_END_NOTICE
+            return msg
+
+        filtered = [
+            block
+            for block in msg.content
+            if not (
+                isinstance(block, dict) and block.get("type") == "tool_use"
             )
-            return await super()._summarizing()
+        ]
+
+        n_removed = len(msg.content) - len(filtered)
+        if n_removed:
+            logger.debug(
+                "Stripped %d tool_use block(s) from _summarizing response",
+                n_removed,
+            )
+
+        filtered.append({"type": "text", "text": CoPawAgent._ROUND_END_NOTICE})
+        msg.content = filtered
+        return msg
 
     @staticmethod
     def _is_bad_request_or_media_error(exc: Exception) -> bool:
@@ -714,6 +900,7 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
             return msg
 
         # Normal message processing
+        logger.info("CoPawAgent.reply: max_iters=%s", self.max_iters)
         return await super().reply(msg=msg, structured_model=structured_model)
 
     async def interrupt(self, msg: Msg | list[Msg] | None = None) -> None:

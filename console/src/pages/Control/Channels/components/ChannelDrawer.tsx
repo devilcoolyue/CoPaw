@@ -53,7 +53,6 @@ const CHANNELS_WITH_ACCESS_CONTROL: ChannelKey[] = [
   "wecom",
   "mattermost",
   "matrix",
-  "xiaoyi",
 ];
 
 // Doc EN URLs per channel (anchors on https://copaw.agentscope.io/docs/channels)
@@ -390,6 +389,21 @@ export function ChannelDrawer({
       case "feishu":
         return (
           <>
+            <Form.Item
+              name="domain"
+              label={t("channels.feishuRegion")}
+              initialValue="feishu"
+              tooltip={t("channels.feishuRegionTooltip")}
+            >
+              <Select>
+                <Select.Option value="feishu">
+                  {t("channels.feishuChina")}
+                </Select.Option>
+                <Select.Option value="lark">
+                  {t("channels.feishuInternational")}
+                </Select.Option>
+              </Select>
+            </Form.Item>
             <Form.Item
               name="app_id"
               label="App ID"

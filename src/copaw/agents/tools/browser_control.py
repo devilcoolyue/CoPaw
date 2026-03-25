@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -30,10 +31,22 @@ from ...config import (
     get_system_default_browser,
     is_running_in_container,
 )
+from ...config.context import get_current_workspace_dir
+from ...constant import WORKING_DIR
 
 from .browser_snapshot import build_role_snapshot_from_aria
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_output_path(path: str) -> str:
+    """Resolve relative output paths under workspace_dir/browser/."""
+    if Path(path).is_absolute():
+        return path
+    base_dir = (get_current_workspace_dir() or WORKING_DIR) / "browser"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return str(base_dir / path)
+
 
 # Hybrid mode detection: Windows + Uvicorn reload mode requires sync Playwright
 # to avoid NotImplementedError with asyncio.create_subprocess_exec.
@@ -1737,6 +1750,7 @@ async def _action_screenshot(
     if not path:
         ext = "jpeg" if screenshot_type == "jpeg" else "png"
         path = f"page-{int(time.time())}.{ext}"
+    path = _resolve_output_path(path)
     page = _get_page(page_id)
     if not page:
         return _tool_response(
@@ -2135,6 +2149,7 @@ async def _action_eval(page_id: str, code: str) -> ToolResponse:
 
 async def _action_pdf(page_id: str, path: str) -> ToolResponse:
     path = (path or "page.pdf").strip() or "page.pdf"
+    path = _resolve_output_path(path)
     page = _get_page(page_id)
     if not page:
         return _tool_response(
@@ -2623,9 +2638,10 @@ async def _action_snapshot(
         if frame_selector and frame_selector.strip():
             out["frame_selector"] = frame_selector.strip()
         if filename and filename.strip():
-            with open(filename.strip(), "w", encoding="utf-8") as f:
+            resolved = _resolve_output_path(filename.strip())
+            with open(resolved, "w", encoding="utf-8") as f:
                 f.write(snapshot)
-            out["filename"] = filename.strip()
+            out["filename"] = resolved
         return _tool_response(json.dumps(out, ensure_ascii=False, indent=2))
     except Exception as e:
         return _tool_response(
@@ -2829,14 +2845,15 @@ async def _action_console_messages(
     lines = [f"[{m['level']}] {m['text']}" for m in filtered]
     text = "\n".join(lines)
     if filename and filename.strip():
-        with open(filename.strip(), "w", encoding="utf-8") as f:
+        resolved = _resolve_output_path(filename.strip())
+        with open(resolved, "w", encoding="utf-8") as f:
             f.write(text)
         return _tool_response(
             json.dumps(
                 {
                     "ok": True,
-                    "message": f"Console messages saved to {filename}",
-                    "filename": filename.strip(),
+                    "message": f"Console messages saved to {resolved}",
+                    "filename": resolved,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -3199,14 +3216,15 @@ async def _action_network_requests(
     ]
     text = "\n".join(lines)
     if filename and filename.strip():
-        with open(filename.strip(), "w", encoding="utf-8") as f:
+        resolved = _resolve_output_path(filename.strip())
+        with open(resolved, "w", encoding="utf-8") as f:
             f.write(text)
         return _tool_response(
             json.dumps(
                 {
                     "ok": True,
-                    "message": f"Network requests saved to {filename}",
-                    "filename": filename.strip(),
+                    "message": f"Network requests saved to {resolved}",
+                    "filename": resolved,
                 },
                 ensure_ascii=False,
                 indent=2,
