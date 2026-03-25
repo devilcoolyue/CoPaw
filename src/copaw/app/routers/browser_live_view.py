@@ -51,8 +51,10 @@ router = APIRouter(prefix="/browser", tags=["browser"])
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_JPEG_QUALITY = 90
+_JPEG_QUALITY = 65
 _FRAME_INTERVAL = 0.2  # ~5 fps (screenshot fallback only)
+_CDP_MIN_FRAME_INTERVAL = 0.1  # 100ms = ~10 fps cap for CDP
+_WS_PING_INTERVAL = 15  # seconds between server pings
 
 # ---------------------------------------------------------------------------
 # Connected WebSocket clients (keyed by agent_id)
@@ -65,6 +67,8 @@ _screencaster_task: asyncio.Task | None = None
 # ---------------------------------------------------------------------------
 _cdp_sessions: dict[str, Any] = {}  # agent_id -> CDPSession
 _cdp_pages: dict[str, Any] = {}  # agent_id -> page when CDP started
+_cdp_sending: dict[str, bool] = {}  # agent_id -> broadcast in progress
+_cdp_last_frame_time: dict[str, float] = {}  # agent_id -> monotonic ts
 
 # ---------------------------------------------------------------------------
 # REST endpoint
@@ -205,10 +209,58 @@ async def _start_cdp_screencast(agent_id: str) -> bool:
         return False
 
     last_url: dict[str, str] = {"value": ""}
+    _cdp_sending[agent_id] = False
+    _cdp_last_frame_time[agent_id] = 0.0
+
+    async def _send_frame(
+        metadata: str,
+        jpeg_bytes: bytes,
+        session_id: int,
+    ) -> None:
+        """Broadcast one frame with backpressure tracking."""
+        try:
+            await _broadcast_to_agent(
+                agent_id,
+                text=metadata,
+                data=jpeg_bytes,
+            )
+        finally:
+            _cdp_sending[agent_id] = False
+            # ACK after broadcast so CDP respects our pace
+            if agent_id in _cdp_sessions:
+                try:
+                    await cdp.send(
+                        "Page.screencastFrameAck",
+                        {"sessionId": session_id},
+                    )
+                except Exception:
+                    pass
 
     def _on_frame(params: dict) -> None:
         """Handle a CDP screencastFrame event."""
+        # Guard: skip if CDP session already torn down
+        if agent_id not in _cdp_sessions:
+            return
+        # Backpressure: skip frame if previous send in progress
+        if _cdp_sending.get(agent_id):
+            return
+        # Throttle: enforce minimum interval between frames
+        now = time.monotonic()
+        elapsed = now - _cdp_last_frame_time.get(agent_id, 0.0)
+        if elapsed < _CDP_MIN_FRAME_INTERVAL:
+            # ACK immediately so CDP keeps running, but drop frame
+            asyncio.ensure_future(
+                cdp.send(
+                    "Page.screencastFrameAck",
+                    {"sessionId": params["sessionId"]},
+                ),
+            )
+            return
+
         try:
+            _cdp_sending[agent_id] = True
+            _cdp_last_frame_time[agent_id] = now
+
             jpeg_bytes = base64.b64decode(params["data"])
             meta = params.get("metadata", {})
             w = meta.get("deviceWidth", vp_w)
@@ -235,26 +287,23 @@ async def _start_cdp_screencast(agent_id: str) -> bool:
                         },
                     )
                     asyncio.ensure_future(
-                        _broadcast_to_agent(agent_id, text=nav_msg),
+                        _broadcast_to_agent(
+                            agent_id,
+                            text=nav_msg,
+                        ),
                     )
             except Exception:
                 pass
 
             asyncio.ensure_future(
-                _broadcast_to_agent(
-                    agent_id,
-                    text=metadata,
-                    data=jpeg_bytes,
-                ),
-            )
-            # ACK so the browser sends the next frame
-            asyncio.ensure_future(
-                cdp.send(
-                    "Page.screencastFrameAck",
-                    {"sessionId": params["sessionId"]},
+                _send_frame(
+                    metadata,
+                    jpeg_bytes,
+                    params["sessionId"],
                 ),
             )
         except Exception:
+            _cdp_sending[agent_id] = False
             logger.debug(
                 "CDP frame handler error",
                 exc_info=True,
@@ -300,6 +349,8 @@ async def _stop_cdp_screencast(agent_id: str) -> None:
     """Stop CDP screencast for *agent_id* and detach the session."""
     cdp = _cdp_sessions.pop(agent_id, None)
     _cdp_pages.pop(agent_id, None)
+    _cdp_sending.pop(agent_id, None)
+    _cdp_last_frame_time.pop(agent_id, None)
     if cdp is None:
         return
     try:
@@ -801,6 +852,22 @@ async def browser_ws(
 
     _ensure_screencaster()
 
+    # Server-side ping to keep the connection alive
+    async def _ping_loop() -> None:
+        try:
+            while True:
+                await asyncio.sleep(_WS_PING_INTERVAL)
+                try:
+                    await websocket.send_text(
+                        json.dumps({"type": "ping"}),
+                    )
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    ping_task = asyncio.ensure_future(_ping_loop())
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -810,7 +877,9 @@ async def browser_ws(
                 continue
 
             msg_type = data.get("type", "")
-            if msg_type == "mouse":
+            if msg_type == "pong":
+                continue
+            elif msg_type == "mouse":
                 await _handle_mouse(data, agent_id)
             elif msg_type == "keyboard":
                 await _handle_keyboard(data, agent_id)
@@ -832,6 +901,7 @@ async def browser_ws(
     except Exception:
         logger.debug("Browser WS error", exc_info=True)
     finally:
+        ping_task.cancel()
         clients.discard(websocket)
         # Clean up empty sets
         if not clients:

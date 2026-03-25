@@ -61,6 +61,7 @@ export default function BrowserLiveView({
   const [tabs, setTabs] = useState<TabInfo[]>([]);
 
   const expectingFrameRef = useRef(false);
+  const renderingRef = useRef(false);
   const urlFocusedRef = useRef(false);
   const composingRef = useRef(false);
 
@@ -87,8 +88,18 @@ export default function BrowserLiveView({
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let closed = false;
 
-    function handleTextMessage(msg: Record<string, unknown>) {
+    function handleTextMessage(
+      msg: Record<string, unknown>,
+      ws: WebSocket | null,
+    ) {
       const type = msg.type as string;
+
+      if (type === "ping") {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "pong" }));
+        }
+        return;
+      }
 
       if (type === "session") {
         const vp = msg.viewport as
@@ -161,14 +172,17 @@ export default function BrowserLiveView({
         if (typeof event.data === "string") {
           try {
             const msg = JSON.parse(event.data);
-            handleTextMessage(msg);
+            handleTextMessage(msg, ws);
           } catch {
             // ignore
           }
         } else if (event.data instanceof ArrayBuffer) {
           if (expectingFrameRef.current) {
             expectingFrameRef.current = false;
-            renderFrame(event.data);
+            // Skip frame if previous render hasn't finished
+            if (!renderingRef.current) {
+              renderFrame(event.data);
+            }
           }
         }
       };
@@ -190,17 +204,23 @@ export default function BrowserLiveView({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    renderingRef.current = true;
     const blob = new Blob([data], { type: "image/jpeg" });
     const imgUrl = URL.createObjectURL(blob);
     const img = new Image();
     img.onload = () => {
-      canvas.width = img.width;
-      canvas.height = img.height;
+      // Only resize canvas when dimensions actually change
+      if (canvas.width !== img.width || canvas.height !== img.height) {
+        canvas.width = img.width;
+        canvas.height = img.height;
+      }
       ctx.drawImage(img, 0, 0);
       URL.revokeObjectURL(imgUrl);
+      renderingRef.current = false;
     };
     img.onerror = () => {
       URL.revokeObjectURL(imgUrl);
+      renderingRef.current = false;
     };
     img.src = imgUrl;
   }
