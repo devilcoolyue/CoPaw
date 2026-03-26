@@ -1,0 +1,116 @@
+# =============================================================================
+# CoPaw Standalone Dockerfile (public base images, embedded browser)
+# Build: docker build -f deploy/Dockerfile.full -t copaw:latest .
+# Run:   docker run -d -p 8088:8088 --name copaw copaw:latest
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1: Build console frontend
+# -----------------------------------------------------------------------------
+FROM node:20-slim AS console-builder
+WORKDIR /app
+COPY console /app/console
+RUN cd /app/console && npm ci --include=dev && npm run build
+
+# -----------------------------------------------------------------------------
+# Stage 2: Runtime — Python 3.11 + Node.js + Chromium + Xvfb/XFCE4
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim-bookworm
+
+# ── Environment ──────────────────────────────────────────────────────────────
+ENV NODE_ENV=production \
+    WORKSPACE_DIR=/app \
+    COPAW_WORKING_DIR=/app/working \
+    COPAW_SECRET_DIR=/app/working.secret \
+    COPAW_RUNNING_IN_CONTAINER=1
+
+# Channel filtering (override at runtime with -e)
+ARG COPAW_DISABLED_CHANNELS="imessage"
+ENV COPAW_DISABLED_CHANNELS=${COPAW_DISABLED_CHANNELS}
+ARG COPAW_ENABLED_CHANNELS=""
+ENV COPAW_ENABLED_CHANNELS=${COPAW_ENABLED_CHANNELS}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ── System packages: build tools, X11, XFCE desktop, supervisor, fonts ──────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        gnupg \
+        build-essential \
+        libssl-dev \
+        git \
+        supervisor \
+        vim-tiny \
+        gettext-base \
+        # Virtual display & desktop (required for Playwright headed mode)
+        xvfb \
+        xfce4 \
+        xfce4-terminal \
+        dbus-x11 \
+        # CJK fonts
+        fonts-wqy-zenhei \
+        fonts-wqy-microhei \
+        fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Chromium browser + dependencies ─────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        chromium \
+        libx11-xcb1 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxext6 \
+        libxfixes3 \
+        libxi6 \
+        libxtst6 \
+        libnss3 \
+        libglib2.0-0 \
+        libdrm2 \
+        libgbm1 \
+        libasound2 \
+        libu2f-udev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Allow Chromium to run as root (no sandbox in container)
+RUN if [ -f /usr/bin/chromium ]; then \
+        sed -i 's/^CHROMIUM_FLAGS=""/CHROMIUM_FLAGS="--no-sandbox"/' /usr/bin/chromium 2>/dev/null || true; \
+    fi
+
+# ── Node.js 20 (runtime, for potential skill/tool needs) ────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
+
+# ── Playwright: use system Chromium ─────────────────────────────────────────
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# ── Python app ──────────────────────────────────────────────────────────────
+WORKDIR /app
+
+RUN python -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+
+# Install Python dependencies first (cache layer)
+COPY pyproject.toml setup.py README.md ./
+COPY src ./src
+
+# Inject console dist from build stage
+COPY --from=console-builder /app/console/dist/ ./src/copaw/console/
+
+RUN pip install --no-cache-dir .[ollama]
+
+# Init working dir with default config
+RUN copaw init --defaults --accept-security
+
+# ── Supervisord config + entrypoint ─────────────────────────────────────────
+ENV COPAW_PORT=8088
+
+COPY deploy/config/supervisord.conf.template /etc/supervisor/conf.d/supervisord.conf.template
+COPY --chmod=755 deploy/entrypoint.sh /entrypoint.sh
+
+EXPOSE ${COPAW_PORT}
+
+CMD ["/entrypoint.sh"]
